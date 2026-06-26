@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 
-from bot.database.db import get_db
+from bot.database.db import get_db, fetchone, fetchall
 
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
@@ -31,7 +31,7 @@ async def _send_reminders(bot: Bot) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     async with get_db() as db:
         # Matches starting within the next 2 hours that are still scheduled
-        rows = await db.execute_fetchall(
+        rows = await fetchall(db, 
             """
             SELECT m.id, m.team_home, m.team_away, m.kickoff_msk,
                    u.telegram_id

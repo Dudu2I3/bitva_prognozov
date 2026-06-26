@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, Document
 
 from bot.config import config
-from bot.database.db import get_db
+from bot.database.db import get_db, fetchone, fetchall
 from bot.services.scoring import score_prediction, Prediction, Match
 
 router = Router()
@@ -32,7 +32,7 @@ def _parse_score(text: str) -> tuple[int, int] | None:
 
 async def _recalculate_match(db, match_id: int) -> int:
     """Recalculate scores for all predictions on a match. Returns count updated."""
-    match_row = await db.execute_fetchone("SELECT * FROM matches WHERE id = ?", (match_id,))
+    match_row = await fetchone(db, "SELECT * FROM matches WHERE id = ?", (match_id,))
     if not match_row or match_row["status"] != "finished":
         return 0
 
@@ -44,7 +44,7 @@ async def _recalculate_match(db, match_id: int) -> int:
         ot_pen_method=match_row["ot_pen_method"],
     )
 
-    predictions = await db.execute_fetchall(
+    predictions = await fetchall(db, 
         "SELECT * FROM predictions WHERE match_id = ?", (match_id,)
     )
     for row in predictions:
@@ -92,7 +92,7 @@ async def cmd_result(message: Message) -> None:
 
     home, away = parsed
     async with get_db() as db:
-        match = await db.execute_fetchone(
+        match = await fetchone(db, 
             "SELECT id, team_home, team_away FROM matches WHERE id = ?", (match_id,)
         )
         if not match:
@@ -138,7 +138,7 @@ async def cmd_playoff_result(message: Message) -> None:
         return
 
     async with get_db() as db:
-        row = await db.execute_fetchone(
+        row = await fetchone(db, 
             "SELECT id FROM matches WHERE id = ? AND status = 'finished'", (match_id,)
         )
         if not row:

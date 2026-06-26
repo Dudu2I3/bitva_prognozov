@@ -15,6 +15,20 @@ async def get_db() -> AsyncIterator[aiosqlite.Connection]:
         yield db
 
 
+async def fetchone(
+    db: aiosqlite.Connection, sql: str, params: tuple = ()
+) -> aiosqlite.Row | None:
+    async with db.execute(sql, params) as cursor:
+        return await cursor.fetchone()
+
+
+async def fetchall(
+    db: aiosqlite.Connection, sql: str, params: tuple = ()
+) -> list[aiosqlite.Row]:
+    async with db.execute(sql, params) as cursor:
+        return await cursor.fetchall()
+
+
 async def init_db() -> None:
     from bot.database.models import SCHEMA
 

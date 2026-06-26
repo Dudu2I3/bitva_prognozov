@@ -5,7 +5,7 @@ from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 
-from bot.database.db import get_db
+from bot.database.db import get_db, fetchone, fetchall
 from bot.keyboards import matches_list_kb, score_input_kb, doubling_kb, playoff_team_kb, playoff_method_kb
 
 router = Router()
@@ -39,7 +39,7 @@ async def cmd_start(message: Message) -> None:
 async def cmd_matches(message: Message) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     async with get_db() as db:
-        rows = await db.execute_fetchall(
+        rows = await fetchall(db, 
             "SELECT id, team_home, team_away, kickoff_msk FROM matches "
             "WHERE status = 'scheduled' AND kickoff_msk > ? ORDER BY kickoff_msk LIMIT 20",
             (now,),
@@ -56,14 +56,14 @@ async def cmd_matches(message: Message) -> None:
 @router.message(Command("me"))
 async def cmd_me(message: Message) -> None:
     async with get_db() as db:
-        user = await db.execute_fetchone(
+        user = await fetchone(db, 
             "SELECT id, doublings_left FROM users WHERE telegram_id = ?",
             (message.from_user.id,),
         )
         if not user:
             await message.answer("Сначала напиши /start.")
             return
-        stats = await db.execute_fetchone(
+        stats = await fetchone(db, 
             """
             SELECT
                 COUNT(*) AS total,
@@ -75,7 +75,7 @@ async def cmd_me(message: Message) -> None:
             """,
             (user["id"],),
         )
-        rank_row = await db.execute_fetchone(
+        rank_row = await fetchone(db, 
             """
             SELECT COUNT(*) + 1 AS rank
             FROM (
@@ -107,7 +107,7 @@ async def cmd_me(message: Message) -> None:
 @router.message(Command("standings"))
 async def cmd_standings(message: Message) -> None:
     async with get_db() as db:
-        rows = await db.execute_fetchall(
+        rows = await fetchall(db, 
             """
             SELECT u.full_name,
                    COALESCE(SUM(p.total_points), 0) AS pts,
@@ -140,7 +140,7 @@ async def cb_predict_start(callback: CallbackQuery) -> None:
     match_id = int(callback.data.split(":")[1])
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     async with get_db() as db:
-        match = await db.execute_fetchone(
+        match = await fetchone(db, 
             "SELECT id, team_home, team_away, kickoff_msk, stage FROM matches WHERE id = ?",
             (match_id,),
         )
@@ -191,7 +191,7 @@ async def cb_double(callback: CallbackQuery) -> None:
 
     # Check if prediction is a draw — offer playoff pick for playoff stage
     async with get_db() as db:
-        match = await db.execute_fetchone(
+        match = await fetchone(db, 
             "SELECT stage, team_home, team_away, kickoff_msk FROM matches WHERE id = ?",
             (match_id,),
         )
@@ -267,14 +267,14 @@ async def _save_prediction(
 ) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     async with get_db() as db:
-        match = await db.execute_fetchone(
+        match = await fetchone(db, 
             "SELECT kickoff_msk FROM matches WHERE id = ?", (match_id,)
         )
         if match["kickoff_msk"] <= now:
             await callback.answer("Матч уже начался — прогноз заблокирован.", show_alert=True)
             return
 
-        user = await db.execute_fetchone(
+        user = await fetchone(db, 
             "SELECT id, doublings_left FROM users WHERE telegram_id = ?",
             (callback.from_user.id,),
         )
@@ -288,7 +288,7 @@ async def _save_prediction(
                 return
 
         # Check for existing prediction (for doubling_left deduction logic)
-        existing = await db.execute_fetchone(
+        existing = await fetchone(db, 
             "SELECT is_doubled FROM predictions WHERE user_id = ? AND match_id = ?",
             (user["id"], match_id),
         )
