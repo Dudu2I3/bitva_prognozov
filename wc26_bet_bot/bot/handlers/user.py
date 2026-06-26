@@ -1,14 +1,34 @@
-import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 
 from bot.database.db import get_db, fetchone, fetchall
-from bot.keyboards import matches_list_kb, score_input_kb, doubling_kb, playoff_team_kb, playoff_method_kb
+from bot.keyboards import (
+    home_score_kb, away_score_kb, doubling_kb,
+    playoff_team_kb, playoff_method_kb,
+    matches_filter_kb,
+)
 
 router = Router()
+
+MSK_TZ = timezone(timedelta(hours=3))
+
+_MONTHS_RU = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля",
+    5: "мая", 6: "июня", 7: "июля", 8: "августа",
+    9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
+}
+
+
+def _fmt_date(dt: datetime) -> str:
+    return f"{dt.day} {_MONTHS_RU[dt.month]}"
+
+
+def _now_msk_str() -> str:
+    return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
 
 # ---------- /start ----------
 
@@ -33,22 +53,140 @@ async def cmd_start(message: Message) -> None:
     )
 
 
-# ---------- /matches ----------
+# ---------- /help ----------
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "📋 <b>Команды бота:</b>\n\n"
+        "/start — Регистрация\n"
+        "/matches — Ближайшие матчи и прогнозы\n"
+        "/my_predictions — Мои прогнозы\n"
+        "/today_results — Результаты сегодняшних матчей\n"
+        "/me — Мой профиль и статистика\n"
+        "/standings — Общий рейтинг\n"
+        "/help — Этот список команд"
+    )
+
+
+# ---------- /matches + filter callbacks ----------
+
+async def _get_matches_with_preds(
+    db, user_id: int, period: str
+) -> tuple[list[dict], str]:
+    now_msk = datetime.now(MSK_TZ)
+    today = now_msk.strftime("%Y-%m-%d")
+
+    match period:
+        case "today":
+            cond = "DATE(kickoff_msk) = ?"
+            params: tuple = (today,)
+            label = f"Сегодня, {_fmt_date(now_msk)}"
+        case "tomorrow":
+            tom = now_msk + timedelta(days=1)
+            cond = "DATE(kickoff_msk) = ?"
+            params = (tom.strftime("%Y-%m-%d"),)
+            label = f"Завтра, {_fmt_date(tom)}"
+        case "week":
+            week_end = (now_msk + timedelta(days=7)).strftime("%Y-%m-%d")
+            cond = "DATE(kickoff_msk) BETWEEN ? AND ?"
+            params = (today, week_end)
+            label = "Эта неделя"
+        case _:
+            cond = "1=1"
+            params = ()
+            label = "Все туры"
+
+    rows = await fetchall(
+        db,
+        f"""
+        SELECT m.id, m.team_home, m.team_away, m.kickoff_msk, m.stage,
+               p.pred_home, p.pred_away, p.is_doubled
+        FROM matches m
+        LEFT JOIN predictions p ON p.match_id = m.id AND p.user_id = ?
+        WHERE m.status = 'scheduled' AND {cond}
+        ORDER BY m.kickoff_msk
+        LIMIT 20
+        """,
+        (user_id, *params),
+    )
+
+    result: list[dict] = []
+    for r in rows:
+        m = {
+            "id": r["id"],
+            "team_home": r["team_home"],
+            "team_away": r["team_away"],
+            "kickoff_msk": r["kickoff_msk"],
+            "stage": r["stage"],
+            "pred": (
+                {
+                    "pred_home": r["pred_home"],
+                    "pred_away": r["pred_away"],
+                    "is_doubled": bool(r["is_doubled"]),
+                }
+                if r["pred_home"] is not None
+                else None
+            ),
+        }
+        result.append(m)
+    return result, label
+
+
+def _format_matches_msg(matches: list[dict], label: str) -> str:
+    if not matches:
+        return f"⚽ <b>Матчи — {label}:</b>\n\nНет предстоящих матчей."
+    lines = [f"⚽ <b>Матчи — {label}:</b>\n"]
+    for m in matches:
+        time_str = str(m["kickoff_msk"])[11:16]
+        lines.append(f"🕐 {time_str}  <b>{m['team_home']} — {m['team_away']}</b>")
+        pred = m.get("pred")
+        if pred:
+            dbl = " (×2)" if pred["is_doubled"] else ""
+            lines.append(f"   ✅ {pred['pred_home']}:{pred['pred_away']}{dbl}")
+        else:
+            lines.append("   📝 Прогноз не сделан")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+async def _render_matches(
+    target,
+    user_telegram_id: int,
+    period: str,
+    edit: bool = False,
+) -> None:
+    async with get_db() as db:
+        user = await fetchone(
+            db, "SELECT id FROM users WHERE telegram_id = ?", (user_telegram_id,)
+        )
+        if not user:
+            text = "Сначала напиши /start."
+            if edit:
+                await target.message.edit_text(text)
+            else:
+                await target.answer(text)
+            return
+        matches, label = await _get_matches_with_preds(db, user["id"], period)
+
+    text = _format_matches_msg(matches, label)
+    kb = matches_filter_kb(period, matches)
+    if edit:
+        await target.message.edit_text(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
 
 @router.message(Command("matches"))
 async def cmd_matches(message: Message) -> None:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    async with get_db() as db:
-        rows = await fetchall(db, 
-            "SELECT id, team_home, team_away, kickoff_msk FROM matches "
-            "WHERE status = 'scheduled' AND kickoff_msk > ? ORDER BY kickoff_msk LIMIT 20",
-            (now,),
-        )
-    if not rows:
-        await message.answer("Нет предстоящих матчей.")
-        return
-    matches = [dict(r) for r in rows]
-    await message.answer("Выбери матч для прогноза:", reply_markup=matches_list_kb(matches))
+    await _render_matches(message, message.from_user.id, "all")
+
+
+@router.callback_query(F.data.startswith("mf:"))
+async def cb_matches_filter(callback: CallbackQuery) -> None:
+    period = callback.data.split(":")[1]
+    await _render_matches(callback, callback.from_user.id, period, edit=True)
+    await callback.answer()
 
 
 # ---------- /me ----------
@@ -56,14 +194,16 @@ async def cmd_matches(message: Message) -> None:
 @router.message(Command("me"))
 async def cmd_me(message: Message) -> None:
     async with get_db() as db:
-        user = await fetchone(db, 
+        user = await fetchone(
+            db,
             "SELECT id, doublings_left FROM users WHERE telegram_id = ?",
             (message.from_user.id,),
         )
         if not user:
             await message.answer("Сначала напиши /start.")
             return
-        stats = await fetchone(db, 
+        stats = await fetchone(
+            db,
             """
             SELECT
                 COUNT(*) AS total,
@@ -75,7 +215,8 @@ async def cmd_me(message: Message) -> None:
             """,
             (user["id"],),
         )
-        rank_row = await fetchone(db, 
+        rank_row = await fetchone(
+            db,
             """
             SELECT COUNT(*) + 1 AS rank
             FROM (
@@ -107,7 +248,8 @@ async def cmd_me(message: Message) -> None:
 @router.message(Command("standings"))
 async def cmd_standings(message: Message) -> None:
     async with get_db() as db:
-        rows = await fetchall(db, 
+        rows = await fetchall(
+            db,
             """
             SELECT u.full_name,
                    COALESCE(SUM(p.total_points), 0) AS pts,
@@ -117,30 +259,134 @@ async def cmd_standings(message: Message) -> None:
             LEFT JOIN predictions p ON p.user_id = u.id AND p.total_points IS NOT NULL
             GROUP BY u.id
             ORDER BY pts DESC, exact DESC, outcomes DESC
-            """
+            """,
         )
     if not rows:
         await message.answer("Рейтинг пуст.")
         return
-    lines = ["🏆 Рейтинг:\n"]
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = ["🏆 <b>Рейтинг:</b>\n"]
     for i, r in enumerate(rows, 1):
         medal = medals.get(i, f"{i}.")
         lines.append(f"{medal} {r['full_name']} — {r['pts']} очк. (точных: {r['exact'] or 0})")
     await message.answer("\n".join(lines))
 
 
-# ---------- Callback: выбор матча → начало ввода прогноза ----------
+# ---------- /today_results ----------
 
-# FSM-state хранится прямо в callback_data цепочке (без aiogram FSM)
-# Формат ввода: predict → home_score → away_score → double → [playoff_team → playoff_method] → сохранение
+@router.message(Command("today_results"))
+async def cmd_today_results(message: Message) -> None:
+    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    async with get_db() as db:
+        matches = await fetchall(
+            db,
+            """
+            SELECT id, team_home, team_away, score_home, score_away,
+                   went_to_extra_time, ot_pen_winner, ot_pen_method
+            FROM matches
+            WHERE status = 'finished' AND DATE(kickoff_msk) = ?
+            ORDER BY kickoff_msk
+            """,
+            (today,),
+        )
+        if not matches:
+            await message.answer(
+                f"Сегодня ({_fmt_date(datetime.now(MSK_TZ))}) сыгранных матчей нет."
+            )
+            return
+
+        lines = [f"📊 <b>Результаты — {_fmt_date(datetime.now(MSK_TZ))}:</b>\n"]
+        for m in matches:
+            ot_str = ""
+            if m["went_to_extra_time"]:
+                ot_str = f" ({m['ot_pen_winner']} через {m['ot_pen_method']})"
+            lines.append(
+                f"⚽ {m['team_home']} <b>{m['score_home']}:{m['score_away']}</b>"
+                f" {m['team_away']}{ot_str}"
+            )
+            preds = await fetchall(
+                db,
+                """
+                SELECT u.full_name, p.pred_home, p.pred_away, p.is_doubled,
+                       p.total_points, p.base_points
+                FROM predictions p
+                JOIN users u ON u.id = p.user_id
+                WHERE p.match_id = ? AND p.total_points IS NOT NULL
+                ORDER BY p.total_points DESC
+                """,
+                (m["id"],),
+            )
+            if preds:
+                for p in preds:
+                    dbl = "×2 " if p["is_doubled"] else ""
+                    icon = "🎯" if p["base_points"] == 3 else ("✅" if p["base_points"] >= 1 else "❌")
+                    pts = p["total_points"]
+                    lines.append(
+                        f"  {icon} {p['full_name']}: {dbl}{p['pred_home']}:{p['pred_away']}"
+                        f" → {pts:+d} очк."
+                    )
+            else:
+                lines.append("  (прогнозов не было)")
+            lines.append("")
+
+    await message.answer("\n".join(lines).rstrip())
+
+
+# ---------- /my_predictions ----------
+
+@router.message(Command("my_predictions"))
+async def cmd_my_predictions(message: Message) -> None:
+    async with get_db() as db:
+        user = await fetchone(
+            db, "SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,)
+        )
+        if not user:
+            await message.answer("Сначала напиши /start.")
+            return
+        rows = await fetchall(
+            db,
+            """
+            SELECT m.team_home, m.team_away, m.kickoff_msk, m.status,
+                   m.score_home, m.score_away,
+                   p.pred_home, p.pred_away, p.is_doubled,
+                   p.total_points, p.base_points
+            FROM predictions p
+            JOIN matches m ON m.id = p.match_id
+            WHERE p.user_id = ?
+            ORDER BY m.kickoff_msk
+            """,
+            (user["id"],),
+        )
+    if not rows:
+        await message.answer("У тебя пока нет прогнозов.")
+        return
+
+    lines = ["📋 <b>Мои прогнозы:</b>\n"]
+    for r in rows:
+        dbl = "×2 " if r["is_doubled"] else ""
+        pred_str = f"{dbl}{r['pred_home']}:{r['pred_away']}"
+        if r["status"] == "finished" and r["total_points"] is not None:
+            icon = "🎯" if r["base_points"] == 3 else ("✅" if r["base_points"] >= 1 else "❌")
+            result_str = f"  ({r['score_home']}:{r['score_away']}) → {r['total_points']:+d} очк."
+            lines.append(
+                f"{icon} {r['team_home']} — {r['team_away']}: {pred_str}{result_str}"
+            )
+        else:
+            date_str = str(r["kickoff_msk"])[:10]
+            lines.append(f"⏳ {r['team_home']} — {r['team_away']} ({date_str}): {pred_str}")
+
+    await message.answer("\n".join(lines))
+
+
+# ---------- Prediction input callbacks ----------
 
 @router.callback_query(F.data.startswith("predict:"))
 async def cb_predict_start(callback: CallbackQuery) -> None:
     match_id = int(callback.data.split(":")[1])
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    now = _now_msk_str()
     async with get_db() as db:
-        match = await fetchone(db, 
+        match = await fetchone(
+            db,
             "SELECT id, team_home, team_away, kickoff_msk, stage FROM matches WHERE id = ?",
             (match_id,),
         )
@@ -151,109 +397,124 @@ async def cb_predict_start(callback: CallbackQuery) -> None:
         await callback.answer("Матч уже начался — прогноз заблокирован.", show_alert=True)
         return
     await callback.message.edit_text(
-        f"Матч: {match['team_home']} — {match['team_away']}\n"
-        f"Введи счёт хозяев:",
-        reply_markup=score_input_kb(match_id),
+        f"Матч: <b>{match['team_home']} — {match['team_away']}</b>\n"
+        f"Введи счёт {match['team_home']}:",
+        reply_markup=home_score_kb(match_id),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("digit:"))
-async def cb_digit(callback: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("hd:"))
+async def cb_home_digit(callback: CallbackQuery) -> None:
     _, match_id_str, digit_str = callback.data.split(":")
-    match_id = int(match_id_str)
-    digit = int(digit_str)
-    text = callback.message.text or ""
-
-    if "счёт хозяев" in text:
-        await callback.message.edit_text(
-            f"{text.splitlines()[0]}\nХозяева: {digit}\nВведи счёт гостей:",
-            reply_markup=score_input_kb(match_id),
+    match_id, digit = int(match_id_str), int(digit_str)
+    async with get_db() as db:
+        match = await fetchone(
+            db, "SELECT team_home, team_away FROM matches WHERE id = ?", (match_id,)
         )
-    elif "счёт гостей" in text:
-        home_score = int(text.split("Хозяева:")[1].split("\n")[0].strip())
-        await callback.message.edit_text(
-            f"{text.splitlines()[0]}\nПрогноз: {home_score}:{digit}\nУдвоить?",
-            reply_markup=doubling_kb(match_id),
-        )
+    await callback.message.edit_text(
+        f"Матч: <b>{match['team_home']} — {match['team_away']}</b>\n"
+        f"{match['team_home']}: {digit}\n"
+        f"Введи счёт {match['team_away']}:",
+        reply_markup=away_score_kb(match_id, digit),
+    )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("double:"))
-async def cb_double(callback: CallbackQuery) -> None:
-    _, match_id_str, choice = callback.data.split(":")
-    match_id = int(match_id_str)
-    is_doubled = choice == "yes"
-    text = callback.message.text or ""
-    score_part = text.split("Прогноз:")[1].split("\n")[0].strip()
-    home_str, away_str = score_part.split(":")
-    pred_home, pred_away = int(home_str), int(away_str)
-
-    # Check if prediction is a draw — offer playoff pick for playoff stage
+@router.callback_query(F.data.startswith("ad:"))
+async def cb_away_digit(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    match_id, home_score, digit = int(parts[1]), int(parts[2]), int(parts[3])
     async with get_db() as db:
-        match = await fetchone(db, 
+        match = await fetchone(
+            db, "SELECT team_home, team_away FROM matches WHERE id = ?", (match_id,)
+        )
+    await callback.message.edit_text(
+        f"Матч: <b>{match['team_home']} — {match['team_away']}</b>\n"
+        f"Прогноз: {home_score}:{digit}\n"
+        f"Удвоить?",
+        reply_markup=doubling_kb(match_id, home_score, digit),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dbl:"))
+async def cb_double_choice(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    match_id, pred_home, pred_away = int(parts[1]), int(parts[2]), int(parts[3])
+    is_doubled = parts[4] == "y"
+    now = _now_msk_str()
+    async with get_db() as db:
+        match = await fetchone(
+            db,
             "SELECT stage, team_home, team_away, kickoff_msk FROM matches WHERE id = ?",
             (match_id,),
         )
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     if match["kickoff_msk"] <= now:
         await callback.answer("Матч уже начался.", show_alert=True)
         return
-
-    # Encode current state in next message text so we can retrieve it later
-    state_line = f"[state:{match_id}:{pred_home}:{pred_away}:{int(is_doubled)}]"
-
     if match["stage"] == "playoff" and pred_home == pred_away:
         await callback.message.edit_text(
-            f"{text.splitlines()[0]}\n{state_line}\n"
-            "Прогноз = ничья в плей-офф. Кто пройдёт дальше?",
-            reply_markup=playoff_team_kb(match_id, match["team_home"], match["team_away"]),
+            f"Матч: <b>{match['team_home']} — {match['team_away']}</b>\n"
+            f"Прогноз: {pred_home}:{pred_away}{'  (×2)' if is_doubled else ''}\n"
+            f"Ничья в плей-офф. Кто пройдёт дальше?",
+            reply_markup=playoff_team_kb(
+                match_id, pred_home, pred_away, int(is_doubled),
+                match["team_home"], match["team_away"],
+            ),
         )
     else:
-        await _save_prediction(callback, match_id, pred_home, pred_away, is_doubled, None, None)
+        await _save_prediction(
+            callback, match_id, pred_home, pred_away, is_doubled, None, None
+        )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("playoff_team:"))
+@router.callback_query(F.data.startswith("pt:"))
 async def cb_playoff_team(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     match_id = int(parts[1])
-    team = parts[2]  # team name or 'skip'
+    pred_home, pred_away, doubled_int = int(parts[2]), int(parts[3]), int(parts[4])
+    winner_code = parts[5]  # h / a / s
+    is_doubled = bool(doubled_int)
 
-    if team == "skip":
-        state = _parse_state(callback.message.text or "")
-        await _save_prediction(callback, match_id, state["pred_home"], state["pred_away"],
-                               state["is_doubled"], None, None)
+    if winner_code == "s":
+        await _save_prediction(
+            callback, match_id, pred_home, pred_away, is_doubled, None, None
+        )
         return
 
+    async with get_db() as db:
+        match = await fetchone(
+            db, "SELECT team_home, team_away FROM matches WHERE id = ?", (match_id,)
+        )
+    team = match["team_home"] if winner_code == "h" else match["team_away"]
     await callback.message.edit_text(
         f"{callback.message.text}\nКоманда: {team}\nКак пройдёт?",
-        reply_markup=playoff_method_kb(match_id, team),
+        reply_markup=playoff_method_kb(match_id, pred_home, pred_away, doubled_int, winner_code),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("playoff_method:"))
+@router.callback_query(F.data.startswith("pm:"))
 async def cb_playoff_method(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     match_id = int(parts[1])
-    team = parts[2]
-    method_raw = parts[3]  # 'OT' | 'PEN' | 'skip'
-    method = None if method_raw == "skip" else method_raw
+    pred_home, pred_away, doubled_int = int(parts[2]), int(parts[3]), int(parts[4])
+    winner_code = parts[5]
+    method_code = parts[6]  # O / P / S
 
-    state = _parse_state(callback.message.text or "")
-    await _save_prediction(callback, match_id, state["pred_home"], state["pred_away"],
-                           state["is_doubled"], team, method)
+    is_doubled = bool(doubled_int)
+    method = {"O": "OT", "P": "PEN", "S": None}[method_code]
 
-
-def _parse_state(text: str) -> dict:
-    for line in text.splitlines():
-        if line.startswith("[state:"):
-            _, mid, ph, pa, dbl = line.strip("[]").split(":")
-            return {"match_id": int(mid), "pred_home": int(ph),
-                    "pred_away": int(pa), "is_doubled": bool(int(dbl))}
-    return {}
+    async with get_db() as db:
+        match = await fetchone(
+            db, "SELECT team_home, team_away FROM matches WHERE id = ?", (match_id,)
+        )
+    team = match["team_home"] if winner_code == "h" else match["team_away"]
+    await _save_prediction(
+        callback, match_id, pred_home, pred_away, is_doubled, team, method
+    )
 
 
 async def _save_prediction(
@@ -265,16 +526,19 @@ async def _save_prediction(
     playoff_team: str | None,
     playoff_method: str | None,
 ) -> None:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    now = _now_msk_str()
     async with get_db() as db:
-        match = await fetchone(db, 
-            "SELECT kickoff_msk FROM matches WHERE id = ?", (match_id,)
+        match = await fetchone(
+            db,
+            "SELECT kickoff_msk, team_home, team_away FROM matches WHERE id = ?",
+            (match_id,),
         )
         if match["kickoff_msk"] <= now:
             await callback.answer("Матч уже начался — прогноз заблокирован.", show_alert=True)
             return
 
-        user = await fetchone(db, 
+        user = await fetchone(
+            db,
             "SELECT id, doublings_left FROM users WHERE telegram_id = ?",
             (callback.from_user.id,),
         )
@@ -282,18 +546,12 @@ async def _save_prediction(
             await callback.answer("Сначала напиши /start.", show_alert=True)
             return
 
-        if is_doubled:
-            if user["doublings_left"] <= 0:
-                await callback.answer("У тебя не осталось удвоений.", show_alert=True)
-                return
-
-        # Check for existing prediction (for doubling_left deduction logic)
-        existing = await fetchone(db, 
+        existing = await fetchone(
+            db,
             "SELECT is_doubled FROM predictions WHERE user_id = ? AND match_id = ?",
             (user["id"], match_id),
         )
-        # Adjust doublings_left
-        prev_doubled = existing["is_doubled"] if existing else False
+        prev_doubled = bool(existing["is_doubled"]) if existing else False
         delta = int(is_doubled) - int(prev_doubled)
         new_left = user["doublings_left"] - delta
         if new_left < 0:
@@ -317,16 +575,21 @@ async def _save_prediction(
              is_doubled, playoff_team, playoff_method),
         )
         await db.execute(
-            "UPDATE users SET doublings_left = ? WHERE id = ?",
-            (new_left, user["id"]),
+            "UPDATE users SET doublings_left = ? WHERE id = ?", (new_left, user["id"])
         )
         await db.commit()
 
-    double_str = " (удвоение ✅)" if is_doubled else ""
+    double_str = "  (×2 удвоение)" if is_doubled else ""
     playoff_str = ""
     if playoff_team:
-        playoff_str = f"\nПлей-офф: {playoff_team}" + (f" ({playoff_method})" if playoff_method else "")
+        playoff_str = f"\n🏆 Плей-офф: {playoff_team}"
+        if playoff_method:
+            playoff_str += f" ({playoff_method})"
+
+    kickoff = str(match["kickoff_msk"])[:16]
     await callback.message.edit_text(
-        f"✅ Прогноз сохранён: {pred_home}:{pred_away}{double_str}{playoff_str}"
+        f"✅ <b>Принято:</b> {match['team_home']} {pred_home}:{pred_away}"
+        f" {match['team_away']}{double_str}{playoff_str}\n"
+        f"⏰ Дедлайн: {kickoff} МСК"
     )
     await callback.answer()

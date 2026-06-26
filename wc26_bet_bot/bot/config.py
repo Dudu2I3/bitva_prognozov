@@ -10,6 +10,7 @@ load_dotenv()
 class Config:
     bot_token: str
     admin_telegram_id: int
+    group_chat_id: int | None  # optional: auto-publish match results here
 
 
 def _load() -> Config:
@@ -17,7 +18,12 @@ def _load() -> Config:
     admin_id = getenv("ADMIN_TELEGRAM_ID")
     if not token or not admin_id:
         raise RuntimeError("BOT_TOKEN and ADMIN_TELEGRAM_ID must be set in .env")
-    return Config(bot_token=token, admin_telegram_id=int(admin_id))
+    group_id = getenv("GROUP_CHAT_ID")
+    return Config(
+        bot_token=token,
+        admin_telegram_id=int(admin_id),
+        group_chat_id=int(group_id) if group_id else None,
+    )
 
 
 config: Config = _load()
