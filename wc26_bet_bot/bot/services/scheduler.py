@@ -11,7 +11,7 @@ scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 async def _lock_started_matches() -> None:
     """Set locked=TRUE on all predictions for matches whose kickoff has passed."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             """
             UPDATE predictions
@@ -29,7 +29,7 @@ async def _lock_started_matches() -> None:
 async def _send_reminders(bot: Bot) -> None:
     """Push reminder to users who have no prediction for matches starting in <2 hours."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    async with await get_db() as db:
+    async with get_db() as db:
         # Matches starting within the next 2 hours that are still scheduled
         rows = await db.execute_fetchall(
             """

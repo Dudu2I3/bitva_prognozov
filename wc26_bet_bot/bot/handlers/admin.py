@@ -91,7 +91,7 @@ async def cmd_result(message: Message) -> None:
         return
 
     home, away = parsed
-    async with await get_db() as db:
+    async with get_db() as db:
         match = await db.execute_fetchone(
             "SELECT id, team_home, team_away FROM matches WHERE id = ?", (match_id,)
         )
@@ -137,7 +137,7 @@ async def cmd_playoff_result(message: Message) -> None:
         await message.answer("match_id должен быть числом.")
         return
 
-    async with await get_db() as db:
+    async with get_db() as db:
         row = await db.execute_fetchone(
             "SELECT id FROM matches WHERE id = ? AND status = 'finished'", (match_id,)
         )
@@ -176,7 +176,7 @@ async def cmd_recalc(message: Message) -> None:
         await message.answer("match_id должен быть числом.")
         return
 
-    async with await get_db() as db:
+    async with get_db() as db:
         count = await _recalculate_match(db, match_id)
 
     if count == 0:
@@ -212,7 +212,7 @@ async def handle_csv_upload(message: Message) -> None:
         return
 
     inserted = 0
-    async with await get_db() as db:
+    async with get_db() as db:
         for row in reader:
             await db.execute(
                 """

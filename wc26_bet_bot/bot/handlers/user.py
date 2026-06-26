@@ -15,7 +15,7 @@ router = Router()
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     tg = message.from_user
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             """
             INSERT INTO users (telegram_id, username, full_name)
@@ -38,7 +38,7 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("matches"))
 async def cmd_matches(message: Message) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    async with await get_db() as db:
+    async with get_db() as db:
         rows = await db.execute_fetchall(
             "SELECT id, team_home, team_away, kickoff_msk FROM matches "
             "WHERE status = 'scheduled' AND kickoff_msk > ? ORDER BY kickoff_msk LIMIT 20",
@@ -55,7 +55,7 @@ async def cmd_matches(message: Message) -> None:
 
 @router.message(Command("me"))
 async def cmd_me(message: Message) -> None:
-    async with await get_db() as db:
+    async with get_db() as db:
         user = await db.execute_fetchone(
             "SELECT id, doublings_left FROM users WHERE telegram_id = ?",
             (message.from_user.id,),
@@ -106,7 +106,7 @@ async def cmd_me(message: Message) -> None:
 
 @router.message(Command("standings"))
 async def cmd_standings(message: Message) -> None:
-    async with await get_db() as db:
+    async with get_db() as db:
         rows = await db.execute_fetchall(
             """
             SELECT u.full_name,
@@ -139,7 +139,7 @@ async def cmd_standings(message: Message) -> None:
 async def cb_predict_start(callback: CallbackQuery) -> None:
     match_id = int(callback.data.split(":")[1])
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    async with await get_db() as db:
+    async with get_db() as db:
         match = await db.execute_fetchone(
             "SELECT id, team_home, team_away, kickoff_msk, stage FROM matches WHERE id = ?",
             (match_id,),
@@ -190,7 +190,7 @@ async def cb_double(callback: CallbackQuery) -> None:
     pred_home, pred_away = int(home_str), int(away_str)
 
     # Check if prediction is a draw — offer playoff pick for playoff stage
-    async with await get_db() as db:
+    async with get_db() as db:
         match = await db.execute_fetchone(
             "SELECT stage, team_home, team_away, kickoff_msk FROM matches WHERE id = ?",
             (match_id,),
@@ -266,7 +266,7 @@ async def _save_prediction(
     playoff_method: str | None,
 ) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    async with await get_db() as db:
+    async with get_db() as db:
         match = await db.execute_fetchone(
             "SELECT kickoff_msk FROM matches WHERE id = ?", (match_id,)
         )

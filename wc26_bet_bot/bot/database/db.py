@@ -1,15 +1,18 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 import aiosqlite
 
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "bot.db"
 
 
-async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA foreign_keys = ON")
-    return db
+@asynccontextmanager
+async def get_db() -> AsyncIterator[aiosqlite.Connection]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA foreign_keys = ON")
+        yield db
 
 
 async def init_db() -> None:
