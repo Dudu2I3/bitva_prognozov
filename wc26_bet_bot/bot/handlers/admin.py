@@ -551,6 +551,15 @@ async def handle_csv_upload(message: Message) -> None:
 
 # ---------- /setup_api ----------
 
+@router.message(Command("check_now"))
+async def cmd_check_now(message: Message) -> None:
+    """Trigger the daily API check immediately (for testing)."""
+    from bot.services.scheduler import _daily_api_check
+    await message.answer("⏳ Запускаю проверку API...")
+    await _daily_api_check(message.bot)
+    await message.answer("✅ Проверка завершена. Если есть новые результаты — см. выше.")
+
+
 @router.message(Command("setup_api"))
 async def cmd_setup_api(message: Message) -> None:
     """Register or re-authenticate with worldcup26.ir API and save token."""
