@@ -192,3 +192,29 @@ def playoff_confirm_kb(match_id: int, winner: str, method: str) -> InlineKeyboar
         ),
         InlineKeyboardButton(text="❌ Отмена", callback_data="acancel"),
     ]])
+
+
+# ── API auto-result keyboards ─────────────────────────────────────────────────
+
+def api_result_kb(match_id: int, home_s: int, away_s: int, needs_playoff: bool) -> InlineKeyboardMarkup:
+    """
+    needs_playoff=True → "Подтвердить" saves score and opens playoff winner selection.
+    needs_playoff=False → "Подтвердить" closes match normally.
+    """
+    confirm_cb = (
+        f"apipo:{match_id}:{home_s}:{away_s}"
+        if needs_playoff else
+        f"apic:{match_id}:{home_s}:{away_s}"
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=confirm_cb),
+        InlineKeyboardButton(text="✏️ Ввести вручную", callback_data=f"apim:{match_id}"),
+    ]])
+
+
+def api_new_round_kb(round_type: str, game_ids: str) -> InlineKeyboardMarkup:
+    """game_ids — comma-separated API game IDs for the round."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="➕ Добавить все", callback_data=f"apinr:{round_type}:{game_ids}"),
+        InlineKeyboardButton(text="❌ Пропустить", callback_data="acancel"),
+    ]])

@@ -1,6 +1,6 @@
 """
 Admin-only handlers: /result (multi-step), /playoff_result, /recalc (with confirm),
-/add_match, /admin_log.  All guarded by ADMIN_TELEGRAM_ID.
+/add_match, /admin_log, /setup_api.  All guarded by ADMIN_TELEGRAM_ID.
 """
 import csv
 import io
@@ -18,8 +18,10 @@ from bot.keyboards import (
     admin_playoff_team_kb, admin_playoff_method_kb, admin_confirm_kb,
     recalc_confirm_kb, recalc_match_list_kb,
     playoff_match_list_kb, playoff_pick_team_kb, playoff_pick_method_kb, playoff_confirm_kb,
+    api_result_kb,
 )
 from bot.services.scoring import score_prediction, Prediction, Match
+from bot.services.api_client import setup_api, fetch_games, en_to_ru, parse_local_date, ROUND_ORDER
 
 router = Router()
 router.message.filter(F.from_user.id == config.admin_telegram_id)
@@ -545,6 +547,157 @@ async def handle_csv_upload(message: Message) -> None:
         await db.commit()
         await _log_admin_action(db, None, "admin:add_match", {"count": inserted})
     await message.answer(f"✅ Загружено матчей: {inserted}")
+
+
+# ---------- /setup_api ----------
+
+@router.message(Command("setup_api"))
+async def cmd_setup_api(message: Message) -> None:
+    """Register or re-authenticate with worldcup26.ir API and save token."""
+    if not config.worldcup_api_email or not config.worldcup_api_password:
+        await message.answer(
+            "❌ WORLDCUP_API_EMAIL и WORLDCUP_API_PASSWORD не заданы в .env"
+        )
+        return
+    try:
+        await message.answer("⏳ Подключаюсь к API...")
+        await setup_api()
+        await message.answer("✅ Токен получен и сохранён. API готов к работе.")
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка: {exc}")
+
+
+# ---------- API auto-result callbacks ----------
+
+@router.callback_query(F.data.startswith("apic:"))
+async def cb_api_confirm(callback: CallbackQuery) -> None:
+    """Confirm API result for a non-draw (or group) match — save score and recalculate."""
+    parts = callback.data.split(":")
+    match_id, home_s, away_s = int(parts[1]), int(parts[2]), int(parts[3])
+    async with get_db() as db:
+        match = await fetchone(db, "SELECT team_home, team_away FROM matches WHERE id = ?", (match_id,))
+        if not match:
+            await callback.answer("Матч не найден.", show_alert=True)
+            return
+        await db.execute(
+            "UPDATE matches SET score_home=?, score_away=?, status='finished' WHERE id=?",
+            (home_s, away_s, match_id),
+        )
+        await db.commit()
+        count = await _recalculate_match(db, match_id)
+        await _log_admin_action(
+            db, match_id, "admin:result",
+            {"score": f"{home_s}:{away_s}", "source": "api"},
+        )
+        await _publish_result(callback.bot, match_id, db)
+    await callback.message.edit_text(
+        f"✅ Результат сохранён (из API)\n"
+        f"{match['team_home']} <b>{home_s}:{away_s}</b> {match['team_away']}\n"
+        f"Пересчитано прогнозов: {count}"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("apipo:"))
+async def cb_api_playoff_open(callback: CallbackQuery) -> None:
+    """
+    API confirmed a playoff draw — save score, then open playoff winner selection.
+    Reuses existing ppt: → ppm: → ppc: flow.
+    """
+    parts = callback.data.split(":")
+    match_id, home_s, away_s = int(parts[1]), int(parts[2]), int(parts[3])
+    async with get_db() as db:
+        match = await fetchone(db, "SELECT team_home, team_away FROM matches WHERE id = ?", (match_id,))
+        if not match:
+            await callback.answer("Матч не найден.", show_alert=True)
+            return
+        await db.execute(
+            "UPDATE matches SET score_home=?, score_away=?, status='finished' WHERE id=?",
+            (home_s, away_s, match_id),
+        )
+        await db.commit()
+        await _log_admin_action(
+            db, match_id, "admin:result",
+            {"score": f"{home_s}:{away_s}", "source": "api", "note": "draw_playoff"},
+        )
+    await callback.message.edit_text(
+        f"Матч: <b>{match['team_home']} {home_s}:{away_s} {match['team_away']}</b>\n"
+        f"Счёт сохранён. Кто прошёл дальше?",
+        reply_markup=playoff_pick_team_kb(match_id, match["team_home"], match["team_away"]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("apim:"))
+async def cb_api_manual(callback: CallbackQuery) -> None:
+    """Open manual score entry flow (reuses existing ahd: → aad: → ... chain)."""
+    match_id = int(callback.data.split(":")[1])
+    async with get_db() as db:
+        match = await fetchone(db, "SELECT team_home, team_away FROM matches WHERE id = ?", (match_id,))
+    if not match:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Матч: <b>{match['team_home']} — {match['team_away']}</b>\n"
+        f"Введи счёт {match['team_home']}:",
+        reply_markup=admin_home_score_kb(match_id),
+    )
+    await callback.answer()
+
+
+# ---------- API new-round callback ----------
+
+@router.callback_query(F.data.startswith("apinr:"))
+async def cb_api_new_round(callback: CallbackQuery) -> None:
+    """Add all games of a new playoff round from API to our DB."""
+    parts = callback.data.split(":", 2)
+    round_type = parts[1]
+    game_ids_str = parts[2] if len(parts) > 2 else ""
+    game_ids = [gid.strip() for gid in game_ids_str.split(",") if gid.strip()]
+
+    if not game_ids:
+        await callback.answer("Нет матчей для добавления.", show_alert=True)
+        return
+
+    try:
+        all_games = await fetch_games()
+    except Exception as exc:
+        await callback.answer(f"Ошибка API: {exc}", show_alert=True)
+        return
+
+    games_by_id = {str(g["id"]): g for g in all_games}
+    inserted = 0
+    async with get_db() as db:
+        for gid in game_ids:
+            g = games_by_id.get(gid)
+            if not g or not g.get("home_team_name_en"):
+                continue
+            team_home = en_to_ru(g["home_team_name_en"])
+            team_away = en_to_ru(g["away_team_name_en"])
+            kickoff = parse_local_date(g["local_date"])
+            match_date = kickoff[:10]
+            await db.execute(
+                """INSERT INTO matches
+                   (match_date, kickoff_msk, stage, team_home, team_away, api_game_id)
+                   VALUES (?, ?, 'playoff', ?, ?, ?)""",
+                (match_date, kickoff, team_home, team_away, gid),
+            )
+            inserted += 1
+        await db.commit()
+        await _log_admin_action(
+            db, None, "admin:add_match",
+            {"count": inserted, "round": round_type, "source": "api"},
+        )
+
+    round_label = {
+        "r16": "1/8 финала", "qf": "Четвертьфинал",
+        "sf": "Полуфинал", "final": "Финал",
+    }.get(round_type, round_type.upper())
+    await callback.message.edit_text(
+        f"✅ Добавлено {inserted} матчей ({round_label}).\n"
+        f"⚠️ Время kickoff_msk примерное (stadium local). Уточни вручную при необходимости."
+    )
+    await callback.answer()
 
 
 # ---------- /admin_log ----------

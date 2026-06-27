@@ -36,4 +36,9 @@ async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON")
         await db.executescript(SCHEMA)
-        await db.commit()
+        # Migration: add api_game_id to matches (idempotent)
+        try:
+            await db.execute("ALTER TABLE matches ADD COLUMN api_game_id TEXT")
+            await db.commit()
+        except Exception:
+            pass

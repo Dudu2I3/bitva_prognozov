@@ -50,4 +50,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
     payload     TEXT,                             -- JSON
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    token       TEXT NOT NULL,
+    obtained_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """

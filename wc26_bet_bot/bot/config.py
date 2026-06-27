@@ -10,7 +10,9 @@ load_dotenv()
 class Config:
     bot_token: str
     admin_telegram_id: int
-    group_chat_id: int | None  # optional: auto-publish match results here
+    group_chat_id: int | None
+    worldcup_api_email: str | None
+    worldcup_api_password: str | None
 
 
 def _load() -> Config:
@@ -23,6 +25,8 @@ def _load() -> Config:
         bot_token=token,
         admin_telegram_id=int(admin_id),
         group_chat_id=int(group_id) if group_id else None,
+        worldcup_api_email=getenv("WORLDCUP_API_EMAIL"),
+        worldcup_api_password=getenv("WORLDCUP_API_PASSWORD"),
     )
 
 

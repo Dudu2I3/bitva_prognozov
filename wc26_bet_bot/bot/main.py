@@ -29,6 +29,7 @@ _ADMIN_EXTRA = [
     BotCommand(command="recalc", description="Пересчёт очков"),
     BotCommand(command="add_match", description="Добавить матчи (CSV)"),
     BotCommand(command="admin_log", description="Лог действий"),
+    BotCommand(command="setup_api", description="Подключить worldcup26.ir API"),
 ]
 
 
