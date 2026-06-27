@@ -85,7 +85,7 @@ async def _log_admin_action(db, match_id: int | None, action: str, payload: dict
     await db.execute(
         "INSERT INTO audit_log (user_id, match_id, action, payload, created_at) "
         "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
-        (config.admin_telegram_id, match_id, action, json.dumps(payload, ensure_ascii=False)),
+        (config.admin_telegram_id, match_id or 0, action, json.dumps(payload, ensure_ascii=False)),
     )
     await db.commit()
 
@@ -668,10 +668,14 @@ async def cb_api_new_round(callback: CallbackQuery) -> None:
         await callback.answer("Нет матчей для добавления.", show_alert=True)
         return
 
+    # Answer Telegram immediately — API fetch can take 10+ seconds
+    await callback.answer()
+    await callback.message.edit_text("⏳ Загружаю данные из API...")
+
     try:
         all_games = await fetch_games()
     except Exception as exc:
-        await callback.answer(f"Ошибка API: {exc}", show_alert=True)
+        await callback.message.edit_text(f"❌ Ошибка API: {exc}")
         return
 
     games_by_id = {str(g["id"]): g for g in all_games}
@@ -705,7 +709,6 @@ async def cb_api_new_round(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         f"✅ Добавлено {inserted} матчей ({round_label}). Время конвертировано в МСК."
     )
-    await callback.answer()
 
 
 # ---------- /admin_log ----------
