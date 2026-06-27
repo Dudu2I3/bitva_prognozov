@@ -217,9 +217,11 @@ async def _check_new_round(bot: Bot) -> None:
     lines = [f"🆕 Новые матчи <b>{round_label}</b> в API:\n"]
     game_ids: list[str] = []
     for g in sorted(round_games, key=lambda x: x.get("local_date", "")):
+        kickoff_msk = local_to_msk(g["local_date"], g.get("stadium_id", ""))
+        msk_label = kickoff_msk[5:16].replace("-", ".").replace(" ", " ")  # "06.28 15:00"
         lines.append(
             f"• {en_to_ru(g['home_team_name_en'])} — {en_to_ru(g['away_team_name_en'])}"
-            f"  ({g['local_date']} local)"
+            f"  {msk_label} МСК"
         )
         game_ids.append(str(g["id"]))
 
