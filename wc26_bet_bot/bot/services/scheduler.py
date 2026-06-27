@@ -7,7 +7,7 @@ from aiogram import Bot
 from bot.config import config
 from bot.database.db import get_db, fetchall, fetchone
 from bot.services.api_client import (
-    fetch_games, ru_to_en, en_to_ru, parse_local_date, ROUND_ORDER,
+    fetch_games, ru_to_en, en_to_ru, local_to_msk, ROUND_ORDER,
 )
 from bot.keyboards import api_result_kb, api_new_round_kb
 
@@ -223,7 +223,7 @@ async def _check_new_round(bot: Bot) -> None:
         )
         game_ids.append(str(g["id"]))
 
-    lines.append("\n⚠️ Время указано по местному (стадиону). После добавления уточни MSK вручную.")
+    lines.append("\nВремя будет автоматически конвертировано в МСК.")
 
     game_ids_str = ",".join(game_ids)
     # Limit callback_data length: if too many IDs, truncate (shouldn't happen for ≤8 games/round)

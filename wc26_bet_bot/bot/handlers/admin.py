@@ -21,7 +21,7 @@ from bot.keyboards import (
     api_result_kb,
 )
 from bot.services.scoring import score_prediction, Prediction, Match
-from bot.services.api_client import setup_api, fetch_games, en_to_ru, parse_local_date, ROUND_ORDER
+from bot.services.api_client import setup_api, fetch_games, en_to_ru, local_to_msk, ROUND_ORDER
 
 router = Router()
 router.message.filter(F.from_user.id == config.admin_telegram_id)
@@ -683,7 +683,7 @@ async def cb_api_new_round(callback: CallbackQuery) -> None:
                 continue
             team_home = en_to_ru(g["home_team_name_en"])
             team_away = en_to_ru(g["away_team_name_en"])
-            kickoff = parse_local_date(g["local_date"])
+            kickoff = local_to_msk(g["local_date"], g.get("stadium_id", ""))
             match_date = kickoff[:10]
             await db.execute(
                 """INSERT INTO matches
@@ -703,8 +703,7 @@ async def cb_api_new_round(callback: CallbackQuery) -> None:
         "qf": "Четвертьфинал", "sf": "Полуфинал", "final": "Финал",
     }.get(round_type, round_type.upper())
     await callback.message.edit_text(
-        f"✅ Добавлено {inserted} матчей ({round_label}).\n"
-        f"⚠️ Время kickoff_msk примерное (stadium local). Уточни вручную при необходимости."
+        f"✅ Добавлено {inserted} матчей ({round_label}). Время конвертировано в МСК."
     )
     await callback.answer()
 

@@ -170,10 +170,36 @@ async def fetch_games() -> list[dict]:
     return []
 
 
-def parse_local_date(local_date: str) -> str:
+# UTC offsets for each WC2026 stadium during summer 2026 (DST in effect for US/Canada).
+# Mexico City & Guadalajara no longer observe DST (abolished 2023) → UTC-6 year-round.
+# Monterrey is a border zone that still observes CDT → UTC-5.
+_STADIUM_UTC_OFFSET: dict[str, int] = {
+    "1": -6,   # Mexico City (Estadio Azteca) — permanent UTC-6
+    "2": -6,   # Guadalajara (Estadio Akron) — permanent UTC-6
+    "3": -5,   # Monterrey (Estadio BBVA) — CDT (border zone)
+    "4": -5,   # Dallas (AT&T Stadium) — CDT
+    "5": -5,   # Houston (NRG Stadium) — CDT
+    "6": -5,   # Kansas City — CDT
+    "7": -4,   # Atlanta — EDT
+    "8": -4,   # Miami — EDT
+    "9": -4,   # Boston — EDT
+    "10": -4,  # Philadelphia — EDT
+    "11": -4,  # New York/New Jersey — EDT
+    "12": -4,  # Toronto — EDT
+    "13": -7,  # Vancouver — PDT
+    "14": -7,  # Seattle — PDT
+    "15": -7,  # San Francisco — PDT
+    "16": -7,  # Los Angeles — PDT
+}
+_MSK_OFFSET = 3  # UTC+3
+
+
+def local_to_msk(local_date: str, stadium_id: str) -> str:
     """
-    Parse API local_date "MM/DD/YYYY HH:MM" → "YYYY-MM-DD HH:MM:00".
-    NOTE: time is stadium-local, NOT MSK. Admin should verify.
+    Convert API local_date "MM/DD/YYYY HH:MM" (stadium local time) → "YYYY-MM-DD HH:MM:00" MSK.
+    Falls back to adding 7h (Eastern→MSK) if stadium_id is unknown.
     """
     dt = datetime.strptime(local_date, "%m/%d/%Y %H:%M")
-    return dt.strftime("%Y-%m-%d %H:%M:00")
+    utc_offset = _STADIUM_UTC_OFFSET.get(str(stadium_id), -4)  # default: Eastern
+    msk_dt = dt + timedelta(hours=(_MSK_OFFSET - utc_offset))
+    return msk_dt.strftime("%Y-%m-%d %H:%M:00")
