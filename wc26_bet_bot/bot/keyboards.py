@@ -154,7 +154,7 @@ def recalc_confirm_kb(match_id: int) -> InlineKeyboardMarkup:
 def recalc_match_list_kb(matches: list) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for m in matches:
-        score = f" {m['score_home']}:{m['score_away']}" if m.get("score_home") is not None else ""
+        score = f" {m['score_home']}:{m['score_away']}" if m["score_home"] is not None else ""
         label = f"{m['team_home']} — {m['team_away']}{score}"
         builder.button(text=label, callback_data=f"rpm:{m['id']}")
     builder.adjust(1)
