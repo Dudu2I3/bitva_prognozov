@@ -699,8 +699,8 @@ async def cb_api_new_round(callback: CallbackQuery) -> None:
         )
 
     round_label = {
-        "r16": "1/8 финала", "qf": "Четвертьфинал",
-        "sf": "Полуфинал", "final": "Финал",
+        "r32": "1/16 финала", "r16": "1/8 финала",
+        "qf": "Четвертьфинал", "sf": "Полуфинал", "final": "Финал",
     }.get(round_type, round_type.upper())
     await callback.message.edit_text(
         f"✅ Добавлено {inserted} матчей ({round_label}).\n"

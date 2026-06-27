@@ -210,8 +210,8 @@ async def _check_new_round(bot: Bot) -> None:
     earliest_type = min(by_round, key=lambda t: ROUND_ORDER.get(t, 99))
     round_games = by_round[earliest_type]
     round_label = {
-        "r16": "1/8 финала", "qf": "Четвертьфинал",
-        "sf": "Полуфинал", "final": "Финал",
+        "r32": "1/16 финала", "r16": "1/8 финала",
+        "qf": "Четвертьфинал", "sf": "Полуфинал", "final": "Финал",
     }.get(earliest_type, earliest_type.upper())
 
     lines = [f"🆕 Новые матчи <b>{round_label}</b> в API:\n"]

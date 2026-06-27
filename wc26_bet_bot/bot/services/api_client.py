@@ -18,7 +18,7 @@ _TOKEN_TTL_DAYS = 84
 _TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 # Playoff round hierarchy for check_new_round ordering
-ROUND_ORDER: dict[str, int] = {"r16": 1, "qf": 2, "sf": 3, "final": 4}
+ROUND_ORDER: dict[str, int] = {"r32": 0, "r16": 1, "qf": 2, "sf": 3, "final": 4}
 
 # Russian → English team name mapping (all 48 WC2026 participants)
 _RU_TO_EN: dict[str, str] = {
