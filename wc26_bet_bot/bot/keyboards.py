@@ -149,3 +149,46 @@ def recalc_confirm_kb(match_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✅ Пересчитать", callback_data=f"rcf:{match_id}"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="acancel"),
     ]])
+
+
+def recalc_match_list_kb(matches: list) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for m in matches:
+        score = f" {m['score_home']}:{m['score_away']}" if m.get("score_home") is not None else ""
+        label = f"{m['team_home']} — {m['team_away']}{score}"
+        builder.button(text=label, callback_data=f"rpm:{m['id']}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def playoff_match_list_kb(matches: list) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for m in matches:
+        label = f"{m['team_home']} {m['score_home']}:{m['score_away']} {m['team_away']}"
+        builder.button(text=label, callback_data=f"pfm:{m['id']}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def playoff_pick_team_kb(match_id: int, team_home: str, team_away: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=team_home, callback_data=f"ppt:{match_id}:h"),
+        InlineKeyboardButton(text=team_away, callback_data=f"ppt:{match_id}:a"),
+    ]])
+
+
+def playoff_pick_method_kb(match_id: int, winner: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Доп. время (ОТ)", callback_data=f"ppm:{match_id}:{winner}:OT"),
+        InlineKeyboardButton(text="Пенальти (ПЕН)", callback_data=f"ppm:{match_id}:{winner}:PEN"),
+    ]])
+
+
+def playoff_confirm_kb(match_id: int, winner: str, method: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✅ Подтвердить",
+            callback_data=f"ppc:{match_id}:{winner}:{method}",
+        ),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="acancel"),
+    ]])

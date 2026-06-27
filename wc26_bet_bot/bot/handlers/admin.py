@@ -16,7 +16,8 @@ from bot.database.db import get_db, fetchone, fetchall
 from bot.keyboards import (
     admin_match_list_kb, admin_home_score_kb, admin_away_score_kb,
     admin_playoff_team_kb, admin_playoff_method_kb, admin_confirm_kb,
-    recalc_confirm_kb,
+    recalc_confirm_kb, recalc_match_list_kb,
+    playoff_match_list_kb, playoff_pick_team_kb, playoff_pick_method_kb, playoff_confirm_kb,
 )
 from bot.services.scoring import score_prediction, Prediction, Match
 
@@ -349,84 +350,150 @@ async def cb_admin_cancel(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-# ---------- /playoff_result <match_id> <team> <OT|PEN> (kept for backward compat) ----------
+# ---------- /playoff_result — interactive match list ----------
 
 @router.message(Command("playoff_result"))
 async def cmd_playoff_result(message: Message) -> None:
-    args = (message.text or "").split(maxsplit=3)
-    if len(args) < 4:
-        await message.answer("Использование: /playoff_result &lt;match_id&gt; &lt;команда&gt; &lt;OT|PEN&gt;")
-        return
-    match_id_str, team, method = args[1], args[2], args[3].upper()
-    if method not in ("OT", "PEN"):
-        await message.answer("Метод должен быть OT или PEN.")
-        return
-    try:
-        match_id = int(match_id_str)
-    except ValueError:
-        await message.answer("match_id должен быть числом.")
-        return
-
     async with get_db() as db:
-        row = await fetchone(
+        rows = await fetchall(
             db,
-            "SELECT id FROM matches WHERE id = ? AND status = 'finished'",
-            (match_id,),
+            """SELECT id, team_home, team_away, score_home, score_away, kickoff_msk
+               FROM matches
+               WHERE status = 'finished' AND went_to_extra_time = FALSE
+               ORDER BY kickoff_msk DESC LIMIT 20""",
         )
-        if not row:
-            await message.answer(f"Матч #{match_id} не найден или ещё не завершён.")
+    if not rows:
+        await message.answer("Нет завершённых матчей без записи об ОТ/ПЕН.")
+        return
+    await message.answer(
+        "Выбери матч, в котором была ничья и нужно записать победителя по ОТ/ПЕН:",
+        reply_markup=playoff_match_list_kb(list(rows)),
+    )
+
+
+@router.callback_query(F.data.startswith("pfm:"))
+async def cb_playoff_match_select(callback: CallbackQuery) -> None:
+    match_id = int(callback.data.split(":")[1])
+    async with get_db() as db:
+        match = await fetchone(
+            db, "SELECT team_home, team_away, score_home, score_away FROM matches WHERE id = ?", (match_id,)
+        )
+    if not match:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"Матч: <b>{match['team_home']} {match['score_home']}:{match['score_away']} {match['team_away']}</b>\n"
+        f"Кто прошёл дальше?",
+        reply_markup=playoff_pick_team_kb(match_id, match["team_home"], match["team_away"]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ppt:"))
+async def cb_playoff_pick_team(callback: CallbackQuery) -> None:
+    _, match_id_str, winner = callback.data.split(":")
+    match_id = int(match_id_str)
+    async with get_db() as db:
+        match = await fetchone(
+            db, "SELECT team_home, team_away, score_home, score_away FROM matches WHERE id = ?", (match_id,)
+        )
+    team_label = match["team_home"] if winner == "h" else match["team_away"]
+    await callback.message.edit_text(
+        f"Матч: <b>{match['team_home']} {match['score_home']}:{match['score_away']} {match['team_away']}</b>\n"
+        f"Победитель: {team_label}\nКак прошёл?",
+        reply_markup=playoff_pick_method_kb(match_id, winner),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ppm:"))
+async def cb_playoff_pick_method(callback: CallbackQuery) -> None:
+    _, match_id_str, winner, method = callback.data.split(":")
+    match_id = int(match_id_str)
+    async with get_db() as db:
+        match = await fetchone(
+            db, "SELECT team_home, team_away, score_home, score_away FROM matches WHERE id = ?", (match_id,)
+        )
+    team_label = match["team_home"] if winner == "h" else match["team_away"]
+    method_label = "доп. время (ОТ)" if method == "OT" else "пенальти (ПЕН)"
+    await callback.message.edit_text(
+        f"Подтвердить?\n\n"
+        f"Матч: <b>{match['team_home']} {match['score_home']}:{match['score_away']} {match['team_away']}</b>\n"
+        f"Победитель: <b>{team_label}</b> через {method_label}",
+        reply_markup=playoff_confirm_kb(match_id, winner, method),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ppc:"))
+async def cb_playoff_confirm(callback: CallbackQuery) -> None:
+    _, match_id_str, winner, method = callback.data.split(":")
+    match_id = int(match_id_str)
+    async with get_db() as db:
+        match = await fetchone(
+            db, "SELECT team_home, team_away FROM matches WHERE id = ?", (match_id,)
+        )
+        if not match:
+            await callback.answer("Матч не найден.", show_alert=True)
             return
+        team_name = match["team_home"] if winner == "h" else match["team_away"]
         await db.execute(
             "UPDATE matches SET went_to_extra_time=TRUE, ot_pen_winner=?, ot_pen_method=? WHERE id=?",
-            (team, method, match_id),
+            (team_name, method, match_id),
         )
         await db.commit()
         count = await _recalculate_match(db, match_id)
         await _log_admin_action(
-            db, match_id, "admin:playoff_result", {"winner": team, "method": method}
+            db, match_id, "admin:playoff_result", {"winner": team_name, "method": method}
         )
-        await _publish_result(message.bot, match_id, db)
-
-    await message.answer(
-        f"✅ Плей-офф: {team} через {method}\nПересчитано прогнозов: {count}"
+        await _publish_result(callback.bot, match_id, db)
+    method_label = "ОТ" if method == "OT" else "ПЕН"
+    await callback.message.edit_text(
+        f"✅ Записано: {team_name} через {method_label}\nПересчитано прогнозов: {count}"
     )
+    await callback.answer()
 
 
-# ---------- /recalc <match_id> — with confirmation ----------
+# ---------- /recalc — with match list and confirmation ----------
 
 @router.message(Command("recalc"))
 async def cmd_recalc(message: Message) -> None:
-    args = (message.text or "").split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: /recalc &lt;match_id&gt;")
+    async with get_db() as db:
+        rows = await fetchall(
+            db,
+            """SELECT id, team_home, team_away, score_home, score_away, kickoff_msk
+               FROM matches WHERE status = 'finished'
+               ORDER BY kickoff_msk DESC LIMIT 20""",
+        )
+    if not rows:
+        await message.answer("Нет завершённых матчей.")
         return
-    try:
-        match_id = int(args[1])
-    except ValueError:
-        await message.answer("match_id должен быть числом.")
-        return
+    await message.answer("Выбери матч для пересчёта:", reply_markup=recalc_match_list_kb(list(rows)))
 
+
+@router.callback_query(F.data.startswith("rpm:"))
+async def cb_recalc_match_select(callback: CallbackQuery) -> None:
+    match_id = int(callback.data.split(":")[1])
     async with get_db() as db:
         match = await fetchone(
             db,
             "SELECT team_home, team_away, score_home, score_away, status FROM matches WHERE id = ?",
             (match_id,),
         )
-        if not match or match["status"] != "finished":
-            await message.answer(f"Матч #{match_id} не найден или ещё не завершён.")
-            return
         pred_count = await fetchone(
-            db,
-            "SELECT COUNT(*) AS cnt FROM predictions WHERE match_id = ?",
-            (match_id,),
+            db, "SELECT COUNT(*) AS cnt FROM predictions WHERE match_id = ?", (match_id,)
         )
+    if not match or match["status"] != "finished":
+        await callback.answer("Матч не найден или не завершён.", show_alert=True)
+        return
     count = pred_count["cnt"] if pred_count else 0
-    await message.answer(
-        f"Пересчитать матч #{match_id}?\n\n"
+    await callback.message.edit_text(
+        f"Пересчитать матч?\n\n"
         f"{match['team_home']} <b>{match['score_home']}:{match['score_away']}</b> {match['team_away']}\n"
         f"Прогнозов: {count}",
         reply_markup=recalc_confirm_kb(match_id),
     )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("rcf:"))
