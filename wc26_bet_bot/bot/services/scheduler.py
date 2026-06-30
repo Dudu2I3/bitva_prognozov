@@ -9,6 +9,7 @@ from bot.database.db import get_db, fetchall, fetchone
 from bot.services.api_client import (
     fetch_games, ru_to_en, en_to_ru, local_to_msk, ROUND_ORDER,
 )
+from bot.services.scoring import score_prediction, Prediction, Match as MatchData
 from bot.keyboards import api_result_kb, api_new_round_kb
 
 log = logging.getLogger(__name__)
@@ -19,6 +20,20 @@ MSK_TZ = timezone(timedelta(hours=3))
 
 def _now_msk() -> str:
     return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _pts_str(pts: int) -> str:
+    """Russian plural form for points."""
+    a = abs(pts)
+    if 11 <= a % 100 <= 19:
+        form = "очков"
+    elif a % 10 == 1:
+        form = "очко"
+    elif a % 10 in (2, 3, 4):
+        form = "очка"
+    else:
+        form = "очков"
+    return f"{pts:+d} {form}"
 
 
 # ── Lock & reminders (unchanged logic) ───────────────────────────────────────
@@ -73,6 +88,121 @@ async def _send_reminders(bot: Bot) -> None:
             )
         except Exception:
             pass
+
+
+# ── Shared recalc + publish helper ───────────────────────────────────────────
+
+async def _recalc_and_publish(bot: Bot, match_id: int) -> int:
+    """Recalculate all prediction scores for a finished match, publish to group. Returns count."""
+    async with get_db() as db:
+        match_row = await fetchone(db, "SELECT * FROM matches WHERE id = ?", (match_id,))
+        if not match_row or match_row["status"] != "finished":
+            return 0
+        match = MatchData(
+            score_home=match_row["score_home"],
+            score_away=match_row["score_away"],
+            went_to_extra_time=bool(match_row["went_to_extra_time"]),
+            ot_pen_winner=match_row["ot_pen_winner"],
+            ot_pen_method=match_row["ot_pen_method"],
+        )
+        preds = await fetchall(db, "SELECT * FROM predictions WHERE match_id = ?", (match_id,))
+        for row in preds:
+            pred = Prediction(
+                pred_home=row["pred_home"], pred_away=row["pred_away"],
+                is_doubled=bool(row["is_doubled"]),
+                playoff_team=row["playoff_team"], playoff_method=row["playoff_method"],
+            )
+            r = score_prediction(pred, match)
+            await db.execute(
+                "UPDATE predictions SET base_points=?, base_final=?, bonus_points=?, total_points=? WHERE id=?",
+                (r["base_points"], r["base_final"], r["bonus_points"], r["total_points"], row["id"]),
+            )
+        await db.commit()
+
+        ot_str = ""
+        if match_row["went_to_extra_time"]:
+            ot_str = f" ({match_row['ot_pen_winner']} через {match_row['ot_pen_method']})"
+        header = (
+            f"⚽ <b>{match_row['team_home']} "
+            f"{match_row['score_home']}:{match_row['score_away']} "
+            f"{match_row['team_away']}</b>{ot_str}"
+        )
+
+        # Group-chat summary
+        if config.group_chat_id:
+            scored = await fetchall(
+                db,
+                """SELECT u.full_name, p.pred_home, p.pred_away, p.is_doubled,
+                          p.total_points, p.base_points
+                   FROM predictions p JOIN users u ON u.id = p.user_id
+                   WHERE p.match_id = ? AND p.total_points IS NOT NULL
+                   ORDER BY p.total_points DESC""",
+                (match_id,),
+            )
+            lines = [header + "\n"]
+            for p in scored:
+                dbl = "×2 " if p["is_doubled"] else ""
+                icon = "🎯" if p["base_points"] == 3 else ("✅" if p["base_points"] >= 1 else "❌")
+                lines.append(
+                    f"{icon} {p['full_name']}: {dbl}{p['pred_home']}:{p['pred_away']}"
+                    f" → {p['total_points']:+d} очк."
+                )
+            try:
+                await bot.send_message(config.group_chat_id, "\n".join(lines))
+            except Exception as exc:
+                log.error("publish_to_group failed: %s", exc)
+
+        # Individual notifications
+        user_preds = await fetchall(
+            db,
+            """SELECT u.telegram_id, p.pred_home, p.pred_away, p.is_doubled,
+                      p.playoff_team, p.playoff_method,
+                      p.total_points, p.base_points
+               FROM predictions p JOIN users u ON u.id = p.user_id
+               WHERE p.match_id = ? AND p.total_points IS NOT NULL""",
+            (match_id,),
+        )
+        for p in user_preds:
+            try:
+                dbl = "×2 " if p["is_doubled"] else ""
+                icon = "🎯" if p["base_points"] == 3 else ("✅" if p["base_points"] >= 1 else "❌")
+                pred_str = f"{dbl}{p['pred_home']}:{p['pred_away']}"
+                if p["playoff_team"]:
+                    m_str = f" {p['playoff_method']}" if p["playoff_method"] else ""
+                    pred_str += f", {p['playoff_team']}{m_str}"
+                await bot.send_message(
+                    p["telegram_id"],
+                    f"{header}\n\n"
+                    f"Твой прогноз: {pred_str}\n"
+                    f"{icon} {_pts_str(p['total_points'])}",
+                )
+            except Exception as exc:
+                log.debug("Individual notify failed for %s: %s", p["telegram_id"], exc)
+
+    return len(preds)
+
+
+def _detect_ot_pen(api_game: dict) -> tuple[str | None, str | None]:
+    """
+    Try to extract (winner_en, method) from an API game object.
+    Returns (None, None) if not available.
+    method is 'OT' or 'PEN'.
+    """
+    winner_en = (
+        api_game.get("winner") or
+        api_game.get("pen_winner") or
+        api_game.get("extra_time_winner") or
+        api_game.get("winner_en") or
+        api_game.get("knockout_winner")
+    )
+    method: str | None = None
+    if api_game.get("penalties") in ("TRUE", "true", True, 1, "1"):
+        method = "PEN"
+    elif api_game.get("extra_time") in ("TRUE", "true", True, 1, "1"):
+        method = "OT"
+    elif api_game.get("overtime") in ("TRUE", "true", True, 1, "1"):
+        method = "OT"
+    return (winner_en or None, method)
 
 
 # ── API: check finished results ───────────────────────────────────────────────
@@ -131,12 +261,47 @@ async def _check_results(bot: Bot) -> None:
         is_playoff = match["stage"] == "playoff"
         is_draw = home_s == away_s
 
+        # Playoff draw: try auto-detect OT/PEN winner
+        if is_playoff and is_draw:
+            winner_en, method = _detect_ot_pen(api_game)
+            if winner_en and method:
+                winner_ru = en_to_ru(winner_en)
+                async with get_db() as db:
+                    await db.execute(
+                        """UPDATE matches
+                           SET score_home=?, score_away=?, status='finished',
+                               went_to_extra_time=TRUE, ot_pen_winner=?, ot_pen_method=?
+                           WHERE id=?""",
+                        (home_s, away_s, winner_ru, method, match_id),
+                    )
+                    await db.commit()
+                count = await _recalc_and_publish(bot, match_id)
+                try:
+                    await bot.send_message(
+                        config.admin_telegram_id,
+                        f"✅ Авто (API): <b>{match['team_home']} {home_s}:{away_s}"
+                        f" {match['team_away']}</b>\n"
+                        f"➡️ {winner_ru} ({method})\n"
+                        f"Пересчитано прогнозов: {count}",
+                    )
+                except Exception as exc:
+                    log.error("check_results: admin notify failed for match %s: %s", match_id, exc)
+                continue  # done for this match
+
+            # API has no OT/PEN info yet — log for debug and fall through to manual
+            log.info(
+                "check_results: playoff draw match %s, OT/PEN not in API yet. Fields: %s",
+                match_id,
+                {k: v for k, v in api_game.items()
+                 if k not in ("home_team_name_en", "away_team_name_en")},
+            )
+
         text = (
             f"🔔 Результат из API:\n"
             f"<b>{match['team_home']} {home_s}:{away_s} {match['team_away']}</b>\n"
         )
         if is_playoff and is_draw:
-            text += "\n⚠️ Ничья в плей-офф — после подтверждения нужно выбрать победителя."
+            text += "\n⚠️ Ничья в плей-офф — API не дал победителя, выбери вручную."
 
         try:
             await bot.send_message(

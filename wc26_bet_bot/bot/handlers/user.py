@@ -202,43 +202,61 @@ async def cmd_me(message: Message) -> None:
         if not user:
             await message.answer("Сначала напиши /start.")
             return
+        uid = user["id"]
         stats = await fetchone(
             db,
             """
             SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN base_points = 3 THEN 1 ELSE 0 END) AS exact,
-                SUM(CASE WHEN base_points >= 1 THEN 1 ELSE 0 END) AS correct_outcome,
-                COALESCE(SUM(total_points), 0) AS points
-            FROM predictions
-            WHERE user_id = ? AND total_points IS NOT NULL
+                COUNT(CASE WHEN m.team_home != '__adjustment__' THEN 1 END) AS total,
+                SUM(CASE WHEN p.base_points = 3 AND m.team_home != '__adjustment__'
+                         THEN 1 ELSE 0 END) AS exact,
+                SUM(CASE WHEN p.base_points >= 1 AND m.team_home != '__adjustment__'
+                         THEN 1 ELSE 0 END) AS correct_outcome,
+                COALESCE(SUM(p.total_points), 0) AS points
+            FROM predictions p
+            JOIN matches m ON m.id = p.match_id
+            WHERE p.user_id = ? AND p.total_points IS NOT NULL
             """,
-            (user["id"],),
+            (uid,),
         )
+        my_pts = stats["points"]
         rank_row = await fetchone(
             db,
             """
             SELECT COUNT(*) + 1 AS rank
             FROM (
                 SELECT user_id, SUM(total_points) AS pts
-                FROM predictions WHERE total_points IS NOT NULL
-                GROUP BY user_id
+                FROM predictions WHERE total_points IS NOT NULL GROUP BY user_id
             )
-            WHERE pts > (
-                SELECT COALESCE(SUM(total_points), 0)
-                FROM predictions WHERE user_id = ? AND total_points IS NOT NULL
+            WHERE pts > ?
+            """,
+            (my_pts,),
+        )
+        # Points of the player ranked one place above
+        next_row = await fetchone(
+            db,
+            """
+            SELECT MIN(pts) AS next_pts
+            FROM (
+                SELECT user_id, SUM(total_points) AS pts
+                FROM predictions WHERE total_points IS NOT NULL GROUP BY user_id
+                HAVING pts > ?
             )
             """,
-            (user["id"],),
+            (my_pts,),
         )
     rank = rank_row["rank"] if rank_row else "—"
     s = stats
+    gap_line = ""
+    if next_row and next_row["next_pts"] is not None:
+        gap = next_row["next_pts"] - my_pts
+        gap_line = f"\n📈 До следующего места: {gap} очк."
     await message.answer(
-        f"👤 {message.from_user.full_name}\n"
-        f"🏅 Место: {rank}\n"
-        f"⭐ Очки: {s['points']}\n"
+        f"👤 <b>{message.from_user.full_name}</b>\n"
+        f"🏅 Место: {rank}{gap_line}\n"
+        f"⭐ Очки: {my_pts}\n"
         f"🎯 Точных счётов: {s['exact'] or 0}\n"
-        f"✅ Угаданных исходов: {s['correct_outcome'] or 0} из {s['total']}\n"
+        f"✅ Угаданных исходов: {s['correct_outcome'] or 0} из {s['total'] or 0}\n"
         f"✌️ Удвоений осталось: {user['doublings_left']}/8"
     )
 
@@ -285,6 +303,7 @@ async def cmd_today_results(message: Message) -> None:
                    went_to_extra_time, ot_pen_winner, ot_pen_method
             FROM matches
             WHERE status = 'finished' AND DATE(kickoff_msk) = ?
+              AND team_home != '__adjustment__'
             ORDER BY kickoff_msk
             """,
             (today,),
@@ -352,7 +371,7 @@ async def cmd_my_predictions(message: Message) -> None:
                    p.total_points, p.base_points
             FROM predictions p
             JOIN matches m ON m.id = p.match_id
-            WHERE p.user_id = ?
+            WHERE p.user_id = ? AND m.team_home != '__adjustment__'
             ORDER BY m.kickoff_msk
             """,
             (user["id"],),

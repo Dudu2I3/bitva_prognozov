@@ -90,17 +90,30 @@ async def _log_admin_action(db, match_id: int | None, action: str, payload: dict
     await db.commit()
 
 
+def _pts_str(pts: int) -> str:
+    a = abs(pts)
+    if 11 <= a % 100 <= 19:
+        form = "очков"
+    elif a % 10 == 1:
+        form = "очко"
+    elif a % 10 in (2, 3, 4):
+        form = "очка"
+    else:
+        form = "очков"
+    return f"{pts:+d} {form}"
+
+
 async def _publish_result(bot: Bot, match_id: int, db) -> None:
-    """Post result summary to group chat if GROUP_CHAT_ID is configured."""
-    if not config.group_chat_id:
-        return
+    """Post result to group chat (if configured) and notify each user individually."""
     match_row = await fetchone(db, "SELECT * FROM matches WHERE id = ?", (match_id,))
     if not match_row:
         return
     preds = await fetchall(
         db,
         """
-        SELECT u.full_name, p.pred_home, p.pred_away, p.is_doubled,
+        SELECT u.telegram_id, u.full_name,
+               p.pred_home, p.pred_away, p.is_doubled,
+               p.playoff_team, p.playoff_method,
                p.total_points, p.base_points
         FROM predictions p
         JOIN users u ON u.id = p.user_id
@@ -112,25 +125,44 @@ async def _publish_result(bot: Bot, match_id: int, db) -> None:
     ot_str = ""
     if match_row["went_to_extra_time"]:
         ot_str = f" ({match_row['ot_pen_winner']} через {match_row['ot_pen_method']})"
-    lines = [
+    header = (
         f"⚽ <b>{match_row['team_home']} {match_row['score_home']}:{match_row['score_away']}"
-        f" {match_row['team_away']}</b>{ot_str}\n"
-    ]
-    if preds:
-        for p in preds:
+        f" {match_row['team_away']}</b>{ot_str}"
+    )
+
+    # Group chat summary
+    if config.group_chat_id:
+        lines = [header + "\n"]
+        if preds:
+            for p in preds:
+                dbl = "×2 " if p["is_doubled"] else ""
+                icon = "🎯" if p["base_points"] == 3 else ("✅" if p["base_points"] >= 1 else "❌")
+                lines.append(
+                    f"{icon} {p['full_name']}: {dbl}{p['pred_home']}:{p['pred_away']}"
+                    f" → {p['total_points']:+d} очк."
+                )
+        else:
+            lines.append("Прогнозов не было.")
+        try:
+            await bot.send_message(config.group_chat_id, "\n".join(lines))
+        except Exception:
+            pass
+
+    # Individual notifications
+    for p in preds:
+        try:
             dbl = "×2 " if p["is_doubled"] else ""
             icon = "🎯" if p["base_points"] == 3 else ("✅" if p["base_points"] >= 1 else "❌")
-            pts = p["total_points"]
-            lines.append(
-                f"{icon} {p['full_name']}: {dbl}{p['pred_home']}:{p['pred_away']}"
-                f" → {pts:+d} очк."
+            pred_str = f"{dbl}{p['pred_home']}:{p['pred_away']}"
+            if p["playoff_team"]:
+                m_str = f" {p['playoff_method']}" if p["playoff_method"] else ""
+                pred_str += f", {p['playoff_team']}{m_str}"
+            await bot.send_message(
+                p["telegram_id"],
+                f"{header}\n\nТвой прогноз: {pred_str}\n{icon} {_pts_str(p['total_points'])}",
             )
-    else:
-        lines.append("Прогнозов не было.")
-    try:
-        await bot.send_message(config.group_chat_id, "\n".join(lines))
-    except Exception:
-        pass
+        except Exception:
+            pass
 
 
 # ---------- /result — multi-step flow ----------
@@ -362,6 +394,7 @@ async def cmd_playoff_result(message: Message) -> None:
             """SELECT id, team_home, team_away, score_home, score_away, kickoff_msk
                FROM matches
                WHERE status = 'finished' AND went_to_extra_time = FALSE
+                 AND team_home != '__adjustment__'
                ORDER BY kickoff_msk DESC LIMIT 20""",
         )
     if not rows:
@@ -464,7 +497,7 @@ async def cmd_recalc(message: Message) -> None:
         rows = await fetchall(
             db,
             """SELECT id, team_home, team_away, score_home, score_away, kickoff_msk
-               FROM matches WHERE status = 'finished'
+               FROM matches WHERE status = 'finished' AND team_home != '__adjustment__'
                ORDER BY kickoff_msk DESC LIMIT 20""",
         )
     if not rows:
@@ -709,6 +742,262 @@ async def cb_api_new_round(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         f"✅ Добавлено {inserted} матчей ({round_label}). Время конвертировано в МСК."
     )
+
+    if inserted > 0:
+        async with get_db() as db:
+            all_users = await fetchall(db, "SELECT telegram_id FROM users")
+        for u in all_users:
+            try:
+                await callback.bot.send_message(
+                    u["telegram_id"],
+                    f"🆕 <b>{round_label}</b> — открыты прогнозы!\n"
+                    f"Добавлено матчей: {inserted}. Успей поставить до старта → /matches",
+                )
+            except Exception:
+                pass
+
+
+# ---------- /check_predictions ----------
+
+@router.message(Command("check_predictions"))
+async def cmd_check_predictions(message: Message) -> None:
+    async with get_db() as db:
+        total_users = (await fetchone(db, "SELECT COUNT(*) AS cnt FROM users"))["cnt"]
+        matches = await fetchall(
+            db,
+            """SELECT m.id, m.team_home, m.team_away, m.kickoff_msk,
+                      COUNT(p.id) AS pred_count
+               FROM matches m
+               LEFT JOIN predictions p ON p.match_id = m.id
+               WHERE m.status = 'scheduled' AND m.team_home != '__adjustment__'
+               GROUP BY m.id
+               ORDER BY m.kickoff_msk
+               LIMIT 15""",
+        )
+        if not matches:
+            await message.answer("Нет предстоящих матчей.")
+            return
+
+        lines = [f"📋 <b>Прогнозы на предстоящие матчи</b> (всего участников: {total_users}):\n"]
+        for m in matches:
+            pc = m["pred_count"]
+            missing = total_users - pc
+            bar = "✅" * pc + "⬜" * missing
+            time_str = str(m["kickoff_msk"])[5:16].replace("-", ".")
+            lines.append(
+                f"<b>{m['team_home']} — {m['team_away']}</b>  {time_str}\n"
+                f"{bar}  {pc}/{total_users}"
+            )
+            if missing > 0:
+                # Show names of users who haven't predicted
+                no_pred = await fetchall(
+                    db,
+                    """SELECT u.full_name FROM users u
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM predictions p
+                           WHERE p.user_id = u.id AND p.match_id = ?
+                       )""",
+                    (m["id"],),
+                )
+                names = ", ".join(r["full_name"] for r in no_pred)
+                lines.append(f"<i>Не поставили: {names}</i>")
+            lines.append("")
+
+    await message.answer("\n".join(lines).rstrip())
+
+
+# ---------- /export ----------
+
+@router.message(Command("export"))
+async def cmd_export(message: Message) -> None:
+    """Generate and send an Excel table matching the original Битва прогнозов format."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font
+    except ImportError:
+        await message.answer("⚠️ Нет openpyxl: pip install openpyxl")
+        return
+
+    from io import BytesIO
+    from datetime import date as _date
+    from collections import defaultdict
+    from aiogram.types import BufferedInputFile  # noqa: PLC0415
+
+    await message.answer("⏳ Формирую таблицу...")
+
+    async with get_db() as db:
+        # Users sorted by total points descending
+        users_raw = await fetchall(db, "SELECT id, full_name, doublings_left FROM users")
+        pts_rows = await fetchall(
+            db,
+            "SELECT user_id, COALESCE(SUM(total_points),0) AS pts "
+            "FROM predictions WHERE total_points IS NOT NULL GROUP BY user_id",
+        )
+        pts_map: dict[int, int] = {r["user_id"]: r["pts"] for r in pts_rows}
+        exact_rows = await fetchall(
+            db,
+            """SELECT p.user_id, COUNT(*) AS cnt FROM predictions p
+               JOIN matches m ON m.id = p.match_id
+               WHERE p.base_points = 3 AND m.team_home != '__adjustment__'
+                 AND p.total_points IS NOT NULL
+               GROUP BY p.user_id""",
+        )
+        exact_map: dict[int, int] = {r["user_id"]: r["cnt"] for r in exact_rows}
+        users = sorted(
+            users_raw,
+            key=lambda u: (-pts_map.get(u["id"], 0), -exact_map.get(u["id"], 0)),
+        )
+        user_ids = [u["id"] for u in users]
+
+        # All real matches
+        matches = await fetchall(
+            db,
+            "SELECT * FROM matches WHERE team_home != '__adjustment__' ORDER BY kickoff_msk",
+        )
+
+        # All predictions for real matches
+        preds_raw = await fetchall(
+            db,
+            """SELECT p.user_id, p.match_id, p.pred_home, p.pred_away,
+                      p.is_doubled, p.total_points, p.base_points
+               FROM predictions p JOIN matches m ON m.id = p.match_id
+               WHERE m.team_home != '__adjustment__'""",
+        )
+
+        # Group-stage totals (including __adjustment__ for correct doubling offset)
+        group_rows = await fetchall(
+            db,
+            """SELECT p.user_id, COALESCE(SUM(p.total_points),0) AS pts
+               FROM predictions p JOIN matches m ON m.id = p.match_id
+               WHERE m.stage = 'group' AND p.total_points IS NOT NULL
+               GROUP BY p.user_id""",
+        )
+        group_pts_map: dict[int, int] = {r["user_id"]: r["pts"] for r in group_rows}
+
+    pred_map: dict[tuple[int, int], dict] = {
+        (p["user_id"], p["match_id"]): p for p in preds_raw
+    }
+
+    # Per-day points (from real match predictions only)
+    match_date_map = {m["id"]: str(m["kickoff_msk"])[:10] for m in matches}
+    day_pts: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for p in preds_raw:
+        if p["total_points"] is not None:
+            dk = match_date_map.get(p["match_id"], "")
+            if dk:
+                day_pts[dk][p["user_id"]] += p["total_points"]
+
+    # ── Build workbook ──────────────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "ЧМ-2026"
+
+    today_str = _date.today().strftime("%d.%m")
+
+    # Header rows
+    ws.append(["", "", "Количество точных счётов", ""]
+              + [exact_map.get(u["id"], 0) for u in users])
+    ws.append(["", "", f"Осталось удвоений (обн. {today_str})", ""]
+              + [u["doublings_left"] for u in users])
+    ws.append(["Дата", "Время (Мск)", "Матч", "Итог матча"]
+              + [u["full_name"] for u in users])
+
+    bold = Font(bold=True)
+    for cell in ws[3]:  # header row
+        cell.font = bold
+
+    prev_date: str | None = None
+    group_done = False
+
+    for m in matches:
+        m_date = str(m["kickoff_msk"])[:10]
+        m_time = str(m["kickoff_msk"])[11:16]
+
+        # Insert group stage total before first playoff match
+        if not group_done and m["stage"] == "playoff":
+            group_done = True
+            day_total_row(ws, "Итог группового этапа", user_ids,
+                          {uid: group_pts_map.get(uid, 0) for uid in user_ids}, bold)
+
+        # Day total between dates
+        if prev_date and prev_date != m_date:
+            day_total_row(ws, "Итог игрового дня", user_ids, day_pts[prev_date])
+
+        # Format date/time
+        date_fmt = m_date[8:] + "." + m_date[5:7] + "." + m_date[:4]
+        h, mn = m_time.split(":")
+        time_fmt = f"{int(h)}:{mn}"
+
+        match_name = f"{m['team_home']} – {m['team_away']}"
+        if m["status"] == "finished" and m["score_home"] is not None:
+            result = f"{m['score_home']}:{m['score_away']}"
+            if m["went_to_extra_time"] and m["ot_pen_winner"]:
+                result += f" ({m['ot_pen_winner']} через {m['ot_pen_method']})"
+        else:
+            result = ""
+
+        row = [date_fmt, time_fmt, match_name, result]
+        for uid in user_ids:
+            pred = pred_map.get((uid, m["id"]))
+            row.append(
+                f"{pred['pred_home']}:{pred['pred_away']}" if pred and pred["pred_home"] is not None else ""
+            )
+        ws.append(row)
+        prev_date = m_date
+
+    # Last day total
+    if prev_date:
+        day_total_row(ws, "Итог игрового дня", user_ids, day_pts[prev_date])
+
+    # If no playoff matches at all, close group stage
+    if not group_done:
+        day_total_row(ws, "Итог группового этапа", user_ids,
+                      {uid: group_pts_map.get(uid, 0) for uid in user_ids}, bold)
+
+    # Grand total
+    grand = ["Итог битвы", "", "", ""]
+    total_sum = 0
+    for uid in user_ids:
+        v = pts_map.get(uid, 0)
+        grand.append(v)
+        total_sum += v
+    grand.append(total_sum)
+    ws.append(grand)
+    for cell in ws[ws.max_row]:
+        cell.font = bold
+
+    # Column widths
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 34
+    ws.column_dimensions["D"].width = 20
+    for i in range(len(users)):
+        col = openpyxl.utils.get_column_letter(5 + i)
+        ws.column_dimensions[col].width = 12
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    today_full = _date.today().strftime("%d.%m.%Y")
+    await message.answer_document(
+        BufferedInputFile(buf.read(), filename=f"Битва_прогнозов_ЧМ2026_{today_full}.xlsx"),
+        caption=f"📊 Таблица прогнозов ЧМ-2026 на {today_full}",
+    )
+
+
+def day_total_row(ws, label: str, user_ids: list[int],
+                  pts: dict[int, int], font=None) -> None:
+    row = [label, "", "", ""]
+    day_sum = 0
+    for uid in user_ids:
+        v = pts.get(uid, 0)
+        row.append(v if v != 0 else "")
+        day_sum += v
+    row.append(day_sum if day_sum != 0 else "")
+    ws.append(row)
+    if font:
+        for cell in ws[ws.max_row]:
+            cell.font = font
 
 
 # ---------- /admin_log ----------
