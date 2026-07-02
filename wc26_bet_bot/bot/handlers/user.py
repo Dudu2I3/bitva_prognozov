@@ -294,7 +294,12 @@ async def cmd_standings(message: Message) -> None:
 
 @router.message(Command("today_results"))
 async def cmd_today_results(message: Message) -> None:
-    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    now_msk = datetime.now(MSK_TZ)
+    today = now_msk.date()
+    yesterday = today - timedelta(days=1)
+    window_start = f"{yesterday} 15:00:00"
+    window_end = f"{today} 10:00:00"
+
     async with get_db() as db:
         matches = await fetchall(
             db,
@@ -302,19 +307,26 @@ async def cmd_today_results(message: Message) -> None:
             SELECT id, team_home, team_away, score_home, score_away,
                    went_to_extra_time, ot_pen_winner, ot_pen_method
             FROM matches
-            WHERE status = 'finished' AND DATE(kickoff_msk) = ?
+            WHERE status = 'finished'
+              AND kickoff_msk >= ? AND kickoff_msk < ?
               AND team_home != '__adjustment__'
             ORDER BY kickoff_msk
             """,
-            (today,),
+            (window_start, window_end),
         )
         if not matches:
             await message.answer(
-                f"Сегодня ({_fmt_date(datetime.now(MSK_TZ))}) сыгранных матчей нет."
+                f"Нет результатов за период "
+                f"{_fmt_date(now_msk - timedelta(days=1))} 15:00 — "
+                f"{_fmt_date(now_msk)} 10:00 МСК."
             )
             return
 
-        lines = [f"📊 <b>Результаты — {_fmt_date(datetime.now(MSK_TZ))}:</b>\n"]
+        period_label = (
+            f"{_fmt_date(now_msk - timedelta(days=1))} 15:00 — "
+            f"{_fmt_date(now_msk)} 10:00 МСК"
+        )
+        lines = [f"📊 <b>Результаты — {period_label}:</b>\n"]
         for m in matches:
             ot_str = ""
             if m["went_to_extra_time"]:
