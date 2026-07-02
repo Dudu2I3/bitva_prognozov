@@ -813,7 +813,7 @@ async def cmd_export(message: Message) -> None:
     """Generate and send an Excel table matching the original Битва прогнозов format."""
     try:
         import openpyxl
-        from openpyxl.styles import Font
+        from openpyxl.styles import Font, PatternFill, Border, Side
     except ImportError:
         await message.answer("⚠️ Нет openpyxl: pip install openpyxl")
         return
@@ -821,12 +821,11 @@ async def cmd_export(message: Message) -> None:
     from io import BytesIO
     from datetime import date as _date
     from collections import defaultdict
-    from aiogram.types import BufferedInputFile  # noqa: PLC0415
+    from aiogram.types import BufferedInputFile
 
     await message.answer("⏳ Формирую таблицу...")
 
     async with get_db() as db:
-        # Users sorted by total points descending
         users_raw = await fetchall(db, "SELECT id, full_name, doublings_left FROM users")
         pts_rows = await fetchall(
             db,
@@ -849,13 +848,10 @@ async def cmd_export(message: Message) -> None:
         )
         user_ids = [u["id"] for u in users]
 
-        # All real matches
         matches = await fetchall(
             db,
             "SELECT * FROM matches WHERE team_home != '__adjustment__' ORDER BY kickoff_msk",
         )
-
-        # All predictions for real matches
         preds_raw = await fetchall(
             db,
             """SELECT p.user_id, p.match_id, p.pred_home, p.pred_away,
@@ -863,8 +859,6 @@ async def cmd_export(message: Message) -> None:
                FROM predictions p JOIN matches m ON m.id = p.match_id
                WHERE m.team_home != '__adjustment__'""",
         )
-
-        # Group-stage totals (including __adjustment__ for correct doubling offset)
         group_rows = await fetchall(
             db,
             """SELECT p.user_id, COALESCE(SUM(p.total_points),0) AS pts
@@ -877,8 +871,6 @@ async def cmd_export(message: Message) -> None:
     pred_map: dict[tuple[int, int], dict] = {
         (p["user_id"], p["match_id"]): p for p in preds_raw
     }
-
-    # Per-day points (from real match predictions only)
     match_date_map = {m["id"]: str(m["kickoff_msk"])[:10] for m in matches}
     day_pts: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for p in preds_raw:
@@ -887,25 +879,61 @@ async def cmd_export(message: Message) -> None:
             if dk:
                 day_pts[dk][p["user_id"]] += p["total_points"]
 
+    # ── Styles ─────────────────────────────────────────────────────────────
+    N = len(users)
+    _thin = Side(style="thin")
+    _border = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+    _orange = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+    _day_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    _group_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    _grand_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    _bold = Font(bold=True)
+
     # ── Build workbook ──────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "ЧМ-2026"
-
     today_str = _date.today().strftime("%d.%m")
 
-    # Header rows
-    ws.append(["", "", "Количество точных счётов", ""]
-              + [exact_map.get(u["id"], 0) for u in users])
-    ws.append(["", "", f"Осталось удвоений (обн. {today_str})", ""]
-              + [u["doublings_left"] for u in users])
-    ws.append(["Дата", "Время (Мск)", "Матч", "Итог матча"]
-              + [u["full_name"] for u in users])
+    def _add_row(values: list, fill=None, font=None, orange_cols: list[int] | None = None) -> None:
+        """Append a row; apply border, optional fill/font, and orange on specific 1-based cols."""
+        ws.append(values)
+        ri = ws.max_row
+        for ci in range(1, len(values) + 1):
+            cell = ws.cell(row=ri, column=ci)
+            cell.border = _border
+            if fill:
+                cell.fill = fill
+            if font:
+                cell.font = font
+        if orange_cols:
+            for ci in orange_cols:
+                ws.cell(row=ri, column=ci).fill = _orange
 
-    bold = Font(bold=True)
-    for cell in ws[3]:  # header row
-        cell.font = bold
+    def _total_row(label: str, pts_by_uid: dict[int, int], fill=None, font=None) -> None:
+        vals: list = [label, "", "", ""]
+        s = 0
+        for uid in user_ids:
+            v = pts_by_uid.get(uid, 0)
+            vals.append(v if v != 0 else "")
+            s += v
+        vals.append(s if s != 0 else "")
+        _add_row(vals, fill=fill, font=font)
 
+    # ── Header rows (all have N+5 columns: A-D + N players + Σ) ───────────
+    _add_row(["", "", "Количество точных счётов", ""]
+             + [exact_map.get(u["id"], 0) for u in users] + [""],
+             font=_bold)
+    _add_row(["", "", f"Осталось удвоений (обн. {today_str})", ""]
+             + [u["doublings_left"] for u in users] + [""],
+             font=_bold)
+    _add_row(["Дата", "Время (Мск)", "Матч", "Итог матча"]
+             + [u["full_name"] for u in users] + ["Σ"],
+             font=_bold)
+
+    ws.freeze_panes = "A4"
+
+    # ── Match rows ─────────────────────────────────────────────────────────
     prev_date: str | None = None
     group_done = False
 
@@ -913,67 +941,58 @@ async def cmd_export(message: Message) -> None:
         m_date = str(m["kickoff_msk"])[:10]
         m_time = str(m["kickoff_msk"])[11:16]
 
-        # Insert group stage total before first playoff match
         if not group_done and m["stage"] == "playoff":
             group_done = True
-            day_total_row(ws, "Итог группового этапа", user_ids,
-                          {uid: group_pts_map.get(uid, 0) for uid in user_ids}, bold)
+            _total_row("Итог группового этапа",
+                       {uid: group_pts_map.get(uid, 0) for uid in user_ids},
+                       fill=_group_fill, font=_bold)
 
-        # Day total between dates
         if prev_date and prev_date != m_date:
-            day_total_row(ws, "Итог игрового дня", user_ids, day_pts[prev_date])
+            _total_row("Итог игрового дня", day_pts[prev_date], fill=_day_fill)
 
-        # Format date/time
         date_fmt = m_date[8:] + "." + m_date[5:7] + "." + m_date[:4]
         h, mn = m_time.split(":")
         time_fmt = f"{int(h)}:{mn}"
-
         match_name = f"{m['team_home']} – {m['team_away']}"
         if m["status"] == "finished" and m["score_home"] is not None:
             result = f"{m['score_home']}:{m['score_away']}"
             if m["went_to_extra_time"] and m["ot_pen_winner"]:
-                result += f" ({m['ot_pen_winner']} через {m['ot_pen_method']})"
+                result += f" ({m['ot_pen_winner']} {m['ot_pen_method']})"
         else:
             result = ""
 
-        row = [date_fmt, time_fmt, match_name, result]
-        for uid in user_ids:
+        row: list = [date_fmt, time_fmt, match_name, result]
+        orange_cols: list[int] = []
+        for i, uid in enumerate(user_ids):
             pred = pred_map.get((uid, m["id"]))
             row.append(
-                f"{pred['pred_home']}:{pred['pred_away']}" if pred and pred["pred_home"] is not None else ""
+                f"{pred['pred_home']}:{pred['pred_away']}"
+                if pred and pred["pred_home"] is not None else ""
             )
-        ws.append(row)
+            if pred and pred["is_doubled"]:
+                orange_cols.append(5 + i)  # 1-based column index
+        row.append("")  # Σ column empty for match rows
+        _add_row(row, orange_cols=orange_cols or None)
         prev_date = m_date
 
-    # Last day total
     if prev_date:
-        day_total_row(ws, "Итог игрового дня", user_ids, day_pts[prev_date])
+        _total_row("Итог игрового дня", day_pts[prev_date], fill=_day_fill)
 
-    # If no playoff matches at all, close group stage
     if not group_done:
-        day_total_row(ws, "Итог группового этапа", user_ids,
-                      {uid: group_pts_map.get(uid, 0) for uid in user_ids}, bold)
+        _total_row("Итог группового этапа",
+                   {uid: group_pts_map.get(uid, 0) for uid in user_ids},
+                   fill=_group_fill, font=_bold)
 
-    # Grand total
-    grand = ["Итог битвы", "", "", ""]
-    total_sum = 0
-    for uid in user_ids:
-        v = pts_map.get(uid, 0)
-        grand.append(v)
-        total_sum += v
-    grand.append(total_sum)
-    ws.append(grand)
-    for cell in ws[ws.max_row]:
-        cell.font = bold
+    _total_row("Итог битвы", pts_map, fill=_grand_fill, font=_bold)
 
-    # Column widths
+    # ── Column widths ───────────────────────────────────────────────────────
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 10
     ws.column_dimensions["C"].width = 34
-    ws.column_dimensions["D"].width = 20
-    for i in range(len(users)):
-        col = openpyxl.utils.get_column_letter(5 + i)
-        ws.column_dimensions[col].width = 12
+    ws.column_dimensions["D"].width = 22
+    for i in range(N):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(5 + i)].width = 12
+    ws.column_dimensions[openpyxl.utils.get_column_letter(5 + N)].width = 6
 
     buf = BytesIO()
     wb.save(buf)
@@ -983,21 +1002,6 @@ async def cmd_export(message: Message) -> None:
         BufferedInputFile(buf.read(), filename=f"Битва_прогнозов_ЧМ2026_{today_full}.xlsx"),
         caption=f"📊 Таблица прогнозов ЧМ-2026 на {today_full}",
     )
-
-
-def day_total_row(ws, label: str, user_ids: list[int],
-                  pts: dict[int, int], font=None) -> None:
-    row = [label, "", "", ""]
-    day_sum = 0
-    for uid in user_ids:
-        v = pts.get(uid, 0)
-        row.append(v if v != 0 else "")
-        day_sum += v
-    row.append(day_sum if day_sum != 0 else "")
-    ws.append(row)
-    if font:
-        for cell in ws[ws.max_row]:
-            cell.font = font
 
 
 # ---------- /admin_log ----------
