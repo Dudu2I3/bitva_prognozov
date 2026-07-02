@@ -20,6 +20,7 @@ _USER_COMMANDS = [
     BotCommand(command="today_results", description="Результаты сегодняшних матчей"),
     BotCommand(command="me", description="Мой профиль и статистика"),
     BotCommand(command="standings", description="Общий рейтинг"),
+    BotCommand(command="export", description="Таблица прогнозов в Excel"),
     BotCommand(command="help", description="Список команд"),
 ]
 
@@ -32,7 +33,6 @@ _ADMIN_EXTRA = [
     BotCommand(command="setup_api", description="Подключить worldcup26.ir API"),
     BotCommand(command="check_now", description="Проверить результаты API прямо сейчас"),
     BotCommand(command="check_predictions", description="Кто не сделал прогноз"),
-    BotCommand(command="export", description="Выгрузить таблицу в Excel"),
 ]
 
 

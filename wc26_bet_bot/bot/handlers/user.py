@@ -80,6 +80,7 @@ async def cmd_help(message: Message) -> None:
         "/standings — таблица всех участников\n"
         "/my_predictions — все твои прогнозы с результатами\n"
         "/today_results — результаты последних матчей\n"
+        "/export — таблица всех прогнозов в Excel\n"
         "\n"
         "⏰ Прогноз принимается строго до стартового свистка. После — изменить нельзя."
     )
@@ -444,6 +445,196 @@ async def cmd_my_predictions(message: Message) -> None:
             lines.append(f"⏳ {r['team_home']} — {r['team_away']} ({date_str}): {pred_str}")
 
     await message.answer("\n".join(lines))
+
+
+# ---------- /export ----------
+
+@router.message(Command("export"))
+async def cmd_export(message: Message) -> None:
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Border, Side
+    except ImportError:
+        await message.answer("⚠️ Нет openpyxl: pip install openpyxl")
+        return
+
+    from io import BytesIO
+    from datetime import date as _date
+    from collections import defaultdict
+    from aiogram.types import BufferedInputFile
+
+    await message.answer("⏳ Формирую таблицу...")
+
+    async with get_db() as db:
+        users_raw = await fetchall(db, "SELECT id, full_name, doublings_left FROM users")
+        pts_rows = await fetchall(
+            db,
+            "SELECT user_id, COALESCE(SUM(total_points),0) AS pts "
+            "FROM predictions WHERE total_points IS NOT NULL GROUP BY user_id",
+        )
+        pts_map: dict[int, int] = {r["user_id"]: r["pts"] for r in pts_rows}
+        exact_rows = await fetchall(
+            db,
+            """SELECT p.user_id, COUNT(*) AS cnt FROM predictions p
+               JOIN matches m ON m.id = p.match_id
+               WHERE p.base_points = 3 AND m.team_home != '__adjustment__'
+                 AND p.total_points IS NOT NULL
+               GROUP BY p.user_id""",
+        )
+        exact_map: dict[int, int] = {r["user_id"]: r["cnt"] for r in exact_rows}
+        users = sorted(
+            users_raw,
+            key=lambda u: (-pts_map.get(u["id"], 0), -exact_map.get(u["id"], 0)),
+        )
+        user_ids = [u["id"] for u in users]
+
+        matches = await fetchall(
+            db,
+            "SELECT * FROM matches WHERE team_home != '__adjustment__' ORDER BY kickoff_msk",
+        )
+        preds_raw = await fetchall(
+            db,
+            """SELECT p.user_id, p.match_id, p.pred_home, p.pred_away,
+                      p.is_doubled, p.total_points, p.base_points
+               FROM predictions p JOIN matches m ON m.id = p.match_id
+               WHERE m.team_home != '__adjustment__'""",
+        )
+        group_rows = await fetchall(
+            db,
+            """SELECT p.user_id, COALESCE(SUM(p.total_points),0) AS pts
+               FROM predictions p JOIN matches m ON m.id = p.match_id
+               WHERE m.stage = 'group' AND p.total_points IS NOT NULL
+               GROUP BY p.user_id""",
+        )
+        group_pts_map: dict[int, int] = {r["user_id"]: r["pts"] for r in group_rows}
+
+    pred_map: dict[tuple[int, int], dict] = {
+        (p["user_id"], p["match_id"]): p for p in preds_raw
+    }
+    match_date_map = {m["id"]: str(m["kickoff_msk"])[:10] for m in matches}
+    day_pts: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for p in preds_raw:
+        if p["total_points"] is not None:
+            dk = match_date_map.get(p["match_id"], "")
+            if dk:
+                day_pts[dk][p["user_id"]] += p["total_points"]
+
+    N = len(users)
+    _thin = Side(style="thin")
+    _border = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+    _orange = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+    _day_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    _group_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    _grand_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    _bold = Font(bold=True)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "ЧМ-2026"
+    today_str = _date.today().strftime("%d.%m")
+
+    def _add_row(values: list, fill=None, font=None, orange_cols: list[int] | None = None) -> None:
+        ws.append(values)
+        ri = ws.max_row
+        for ci in range(1, len(values) + 1):
+            cell = ws.cell(row=ri, column=ci)
+            cell.border = _border
+            if fill:
+                cell.fill = fill
+            if font:
+                cell.font = font
+        if orange_cols:
+            for ci in orange_cols:
+                ws.cell(row=ri, column=ci).fill = _orange
+
+    def _total_row(label: str, pts_by_uid: dict[int, int], fill=None, font=None) -> None:
+        vals: list = [label, "", "", ""]
+        s = 0
+        for uid in user_ids:
+            v = pts_by_uid.get(uid, 0)
+            vals.append(v if v != 0 else "")
+            s += v
+        vals.append(s if s != 0 else "")
+        _add_row(vals, fill=fill, font=font)
+
+    _add_row(["", "", "Количество точных счётов", ""]
+             + [exact_map.get(u["id"], 0) for u in users] + [""],
+             font=_bold)
+    _add_row(["", "", f"Осталось удвоений (обн. {today_str})", ""]
+             + [u["doublings_left"] for u in users] + [""],
+             font=_bold)
+    _add_row(["Дата", "Время (Мск)", "Матч", "Итог матча"]
+             + [u["full_name"] for u in users] + ["Σ"],
+             font=_bold)
+    ws.freeze_panes = "A4"
+
+    prev_date: str | None = None
+    group_done = False
+
+    for m in matches:
+        m_date = str(m["kickoff_msk"])[:10]
+        m_time = str(m["kickoff_msk"])[11:16]
+
+        if not group_done and m["stage"] == "playoff":
+            group_done = True
+            _total_row("Итог группового этапа",
+                       {uid: group_pts_map.get(uid, 0) for uid in user_ids},
+                       fill=_group_fill, font=_bold)
+
+        if prev_date and prev_date != m_date:
+            _total_row("Итог игрового дня", day_pts[prev_date], fill=_day_fill)
+
+        date_fmt = m_date[8:] + "." + m_date[5:7] + "." + m_date[:4]
+        h, mn = m_time.split(":")
+        time_fmt = f"{int(h)}:{mn}"
+        match_name = f"{m['team_home']} – {m['team_away']}"
+        if m["status"] == "finished" and m["score_home"] is not None:
+            result = f"{m['score_home']}:{m['score_away']}"
+            if m["went_to_extra_time"] and m["ot_pen_winner"]:
+                result += f" ({m['ot_pen_winner']} {m['ot_pen_method']})"
+        else:
+            result = ""
+
+        row: list = [date_fmt, time_fmt, match_name, result]
+        orange_cols: list[int] = []
+        for i, uid in enumerate(user_ids):
+            pred = pred_map.get((uid, m["id"]))
+            row.append(
+                f"{pred['pred_home']}:{pred['pred_away']}"
+                if pred and pred["pred_home"] is not None else ""
+            )
+            if pred and pred["is_doubled"]:
+                orange_cols.append(5 + i)
+        row.append("")
+        _add_row(row, orange_cols=orange_cols or None)
+        prev_date = m_date
+
+    if prev_date:
+        _total_row("Итог игрового дня", day_pts[prev_date], fill=_day_fill)
+
+    if not group_done:
+        _total_row("Итог группового этапа",
+                   {uid: group_pts_map.get(uid, 0) for uid in user_ids},
+                   fill=_group_fill, font=_bold)
+
+    _total_row("Итог битвы", pts_map, fill=_grand_fill, font=_bold)
+
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 34
+    ws.column_dimensions["D"].width = 22
+    for i in range(N):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(5 + i)].width = 12
+    ws.column_dimensions[openpyxl.utils.get_column_letter(5 + N)].width = 6
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    today_full = _date.today().strftime("%d.%m.%Y")
+    await message.answer_document(
+        BufferedInputFile(buf.read(), filename=f"Битва_прогнозов_ЧМ2026_{today_full}.xlsx"),
+        caption=f"📊 Таблица прогнозов ЧМ-2026 на {today_full}",
+    )
 
 
 # ---------- Prediction input callbacks ----------
