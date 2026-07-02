@@ -114,6 +114,7 @@ async def _get_matches_with_preds(
             params = ()
             label = "Все туры"
 
+    now_msk_str = now_msk.strftime("%Y-%m-%d %H:%M:%S")
     rows = await fetchall(
         db,
         f"""
@@ -121,11 +122,11 @@ async def _get_matches_with_preds(
                p.pred_home, p.pred_away, p.is_doubled
         FROM matches m
         LEFT JOIN predictions p ON p.match_id = m.id AND p.user_id = ?
-        WHERE m.status = 'scheduled' AND {cond}
+        WHERE m.status = 'scheduled' AND m.kickoff_msk > ? AND {cond}
         ORDER BY m.kickoff_msk
         LIMIT 20
         """,
-        (user_id, *params),
+        (user_id, now_msk_str, *params),
     )
 
     result: list[dict] = []

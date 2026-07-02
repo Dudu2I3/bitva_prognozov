@@ -321,7 +321,7 @@ async def _check_results(bot: Bot) -> None:
     # Build lookup: (en_home_lower, en_away_lower) → api_game
     finished_by_teams: dict[tuple[str, str], dict] = {}
     for g in games:
-        if g.get("finished") != "TRUE":
+        if g.get("finished") not in ("TRUE", "true", True, 1, "1"):
             continue
         h = g.get("home_team_name_en", "")
         a = g.get("away_team_name_en", "")
