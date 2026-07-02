@@ -36,6 +36,18 @@ def _pts_str(pts: int) -> str:
     return f"{pts:+d} {form}"
 
 
+# ── Admin broadcast helper ───────────────────────────────────────────────────
+
+async def _notify_admins(bot: Bot, text: str, reply_markup=None) -> None:
+    """Send to all admins. Inline buttons go only to the primary admin to avoid double-actions."""
+    for admin_id in config.admin_ids:
+        try:
+            kb = reply_markup if admin_id == config.admin_telegram_id else None
+            await bot.send_message(admin_id, text, reply_markup=kb)
+        except Exception as exc:
+            log.error("notify_admins: failed for %s: %s", admin_id, exc)
+
+
 # ── Lock & reminders (unchanged logic) ───────────────────────────────────────
 
 async def _lock_started_matches() -> None:
@@ -363,16 +375,13 @@ async def _check_results(bot: Bot) -> None:
                     )
                     await db.commit()
                 count = await _recalc_and_publish(bot, match_id)
-                try:
-                    await bot.send_message(
-                        config.admin_telegram_id,
-                        f"✅ Авто (API): <b>{match['team_home']} {home_s}:{away_s}"
-                        f" {match['team_away']}</b>\n"
-                        f"➡️ {winner_ru} ({method})\n"
-                        f"Пересчитано прогнозов: {count}",
-                    )
-                except Exception as exc:
-                    log.error("check_results: admin notify failed for match %s: %s", match_id, exc)
+                await _notify_admins(
+                    bot,
+                    f"✅ Авто (API): <b>{match['team_home']} {home_s}:{away_s}"
+                    f" {match['team_away']}</b>\n"
+                    f"➡️ {winner_ru} ({method})\n"
+                    f"Пересчитано прогнозов: {count}",
+                )
                 continue  # done for this match
 
             # API has no OT/PEN info yet — log for debug and fall through to manual
@@ -390,14 +399,10 @@ async def _check_results(bot: Bot) -> None:
         if is_playoff and is_draw:
             text += "\n⚠️ Ничья в плей-офф — API не дал победителя, выбери вручную."
 
-        try:
-            await bot.send_message(
-                config.admin_telegram_id,
-                text,
-                reply_markup=api_result_kb(match_id, home_s, away_s, is_playoff and is_draw),
-            )
-        except Exception as exc:
-            log.error("check_results: failed to notify admin for match %s: %s", match_id, exc)
+        await _notify_admins(
+            bot, text,
+            reply_markup=api_result_kb(match_id, home_s, away_s, is_playoff and is_draw),
+        )
 
 
 # ── API: check for new playoff rounds ────────────────────────────────────────
@@ -484,14 +489,11 @@ async def _check_new_round(bot: Bot) -> None:
     if len(f"apinr:{earliest_type}:{game_ids_str}") > 60:
         game_ids_str = game_ids_str[:60]
 
-    try:
-        await bot.send_message(
-            config.admin_telegram_id,
-            "\n".join(lines),
-            reply_markup=api_new_round_kb(earliest_type, game_ids_str),
-        )
-    except Exception as exc:
-        log.error("check_new_round: failed to notify admin: %s", exc)
+    await _notify_admins(
+        bot,
+        "\n".join(lines),
+        reply_markup=api_new_round_kb(earliest_type, game_ids_str),
+    )
 
 
 # ── Combined daily job ────────────────────────────────────────────────────────

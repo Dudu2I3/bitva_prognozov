@@ -24,8 +24,8 @@ from bot.services.scoring import score_prediction, Prediction, Match
 from bot.services.api_client import setup_api, fetch_games, en_to_ru, local_to_msk, ROUND_ORDER
 
 router = Router()
-router.message.filter(F.from_user.id == config.admin_telegram_id)
-router.callback_query.filter(F.from_user.id == config.admin_telegram_id)
+router.message.filter(F.from_user.id.in_(config.admin_ids))
+router.callback_query.filter(F.from_user.id.in_(config.admin_ids))
 
 MSK_TZ = timezone(timedelta(hours=3))
 
