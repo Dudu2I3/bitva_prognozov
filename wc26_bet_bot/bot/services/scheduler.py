@@ -56,36 +56,121 @@ async def _lock_started_matches() -> None:
 
 
 async def _send_reminders(bot: Bot) -> None:
-    now = _now_msk()
-    ceiling = (datetime.now(MSK_TZ) + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    """Send one reminder per match ~30 min before kickoff, only to users without a prediction."""
+    now_msk = datetime.now(MSK_TZ)
+    window_start = (now_msk + timedelta(minutes=25)).strftime("%Y-%m-%d %H:%M:%S")
+    window_end = (now_msk + timedelta(minutes=35)).strftime("%Y-%m-%d %H:%M:%S")
     async with get_db() as db:
-        rows = await fetchall(
+        upcoming = await fetchall(
             db,
-            """
-            SELECT m.id, m.team_home, m.team_away, m.kickoff_msk,
-                   u.telegram_id
-            FROM matches m
-            CROSS JOIN users u
-            WHERE m.status = 'scheduled'
-              AND m.kickoff_msk > ?
-              AND m.kickoff_msk <= ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM predictions p
-                  WHERE p.match_id = m.id AND p.user_id = u.id
-              )
-            """,
-            (now, ceiling),
+            """SELECT id, team_home, team_away, kickoff_msk
+               FROM matches
+               WHERE status = 'scheduled'
+                 AND kickoff_msk > ? AND kickoff_msk <= ?
+                 AND reminder_sent = FALSE""",
+            (window_start, window_end),
         )
-    for row in rows:
-        try:
-            await bot.send_message(
-                chat_id=row["telegram_id"],
-                text=(
-                    f"⏰ Напоминание: матч {row['team_home']} — {row['team_away']} "
-                    f"начнётся в {str(row['kickoff_msk'])[:16]} МСК.\n"
-                    "Ты ещё не сделал прогноз! /matches"
-                ),
+        if not upcoming:
+            return
+        for match in upcoming:
+            no_pred_users = await fetchall(
+                db,
+                """SELECT u.telegram_id FROM users u
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM predictions p
+                       WHERE p.match_id = ? AND p.user_id = u.id
+                   )""",
+                (match["id"],),
             )
+            time_str = str(match["kickoff_msk"])[11:16]
+            for u in no_pred_users:
+                try:
+                    await bot.send_message(
+                        u["telegram_id"],
+                        f"⏰ Через ~30 минут: <b>{match['team_home']} — {match['team_away']}</b>"
+                        f" ({time_str} МСК)\nПрогноз не сделан! → /matches",
+                    )
+                except Exception:
+                    pass
+            await db.execute(
+                "UPDATE matches SET reminder_sent = TRUE WHERE id = ?", (match["id"],)
+            )
+        await db.commit()
+
+
+# ── Day summary ──────────────────────────────────────────────────────────────
+
+_day_summaries_sent: set[str] = set()  # in-memory guard, resets on restart
+
+_MONTHS_SHORT = {
+    1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6: "июн",
+    7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек",
+}
+
+
+async def _maybe_send_day_summary(bot: Bot, match_date: str) -> None:
+    """After a result is saved, check if all matches of the day are finished.
+    If so, broadcast a one-line-per-player day summary to all users (once per date)."""
+    if match_date in _day_summaries_sent:
+        return
+    async with get_db() as db:
+        remaining = await fetchone(
+            db,
+            """SELECT COUNT(*) AS cnt FROM matches
+               WHERE DATE(kickoff_msk) = ? AND status = 'scheduled'
+                 AND team_home != '__adjustment__'""",
+            (match_date,),
+        )
+        if not remaining or remaining["cnt"] > 0:
+            return
+        finished = await fetchone(
+            db,
+            """SELECT COUNT(*) AS cnt FROM matches
+               WHERE DATE(kickoff_msk) = ? AND status = 'finished'
+                 AND team_home != '__adjustment__'""",
+            (match_date,),
+        )
+        if not finished or finished["cnt"] == 0:
+            return
+
+        # Per-user points today (all users, 0 if no predictions)
+        day_rows = await fetchall(
+            db,
+            """SELECT u.full_name, u.telegram_id,
+                      COALESCE((
+                          SELECT SUM(p.total_points) FROM predictions p
+                          JOIN matches m ON m.id = p.match_id
+                          WHERE p.user_id = u.id
+                            AND DATE(m.kickoff_msk) = ?
+                            AND m.team_home != '__adjustment__'
+                            AND p.total_points IS NOT NULL
+                      ), 0) AS day_pts
+               FROM users u
+               ORDER BY day_pts DESC, u.full_name""",
+            (match_date,),
+        )
+        all_users = await fetchall(db, "SELECT telegram_id FROM users")
+
+    if not day_rows:
+        return
+
+    _day_summaries_sent.add(match_date)
+
+    dt = datetime.strptime(match_date, "%Y-%m-%d")
+    date_label = f"{dt.day} {_MONTHS_SHORT[dt.month]}"
+    lines = [f"📊 <b>Итог дня — {date_label}:</b>\n"]
+    max_pts = day_rows[0]["day_pts"]
+    for r in day_rows:
+        pts = r["day_pts"]
+        crown = "🏆 " if pts == max_pts and pts > 0 else "   "
+        sign = "+" if pts > 0 else ""
+        lines.append(f"{crown}{sign}{pts}  {r['full_name']}")
+    lines.append("\n/standings — текущий рейтинг")
+    text = "\n".join(lines)
+
+    for u in all_users:
+        try:
+            await bot.send_message(u["telegram_id"], text)
         except Exception:
             pass
 
@@ -179,6 +264,8 @@ async def _recalc_and_publish(bot: Bot, match_id: int) -> int:
             except Exception as exc:
                 log.debug("Individual notify failed for %s: %s", p["telegram_id"], exc)
 
+    match_date = str(match_row["kickoff_msk"])[:10]
+    await _maybe_send_day_summary(bot, match_date)
     return len(preds)
 
 
@@ -417,16 +504,12 @@ async def _daily_api_check(bot: Bot) -> None:
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 def setup_scheduler(bot: Bot) -> None:
+    # Lock predictions every minute when match starts
     scheduler.add_job(_lock_started_matches, "interval", minutes=1, id="lock_matches")
-    scheduler.add_job(
-        _send_reminders, "interval", minutes=30, id="reminders", kwargs={"bot": bot}
-    )
-    scheduler.add_job(
-        _daily_api_check,
-        "cron",
-        hour=10,
-        minute=0,
-        id="daily_api_check",
-        kwargs={"bot": bot},
-    )
+    # Single reminder ~30 min before kickoff (runs every 5 min, uses reminder_sent flag)
+    scheduler.add_job(_send_reminders, "interval", minutes=5, id="reminders", kwargs={"bot": bot})
+    # Check API results every 45 min (results can arrive throughout the day)
+    scheduler.add_job(_check_results, "interval", minutes=45, id="check_results", kwargs={"bot": bot})
+    # Check for new playoff rounds once a day at 10:00 MSK
+    scheduler.add_job(_check_new_round, "cron", hour=10, minute=0, id="check_new_round", kwargs={"bot": bot})
     scheduler.start()

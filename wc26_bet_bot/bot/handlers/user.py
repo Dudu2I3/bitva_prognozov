@@ -245,12 +245,32 @@ async def cmd_me(message: Message) -> None:
             """,
             (my_pts,),
         )
+        # Last 5 scored predictions (oldest→newest for left-to-right timeline)
+        form_rows = await fetchall(
+            db,
+            """SELECT base_points FROM (
+                   SELECT p.base_points, m.kickoff_msk
+                   FROM predictions p
+                   JOIN matches m ON m.id = p.match_id
+                   WHERE p.user_id = ? AND p.base_points IS NOT NULL
+                     AND m.team_home != '__adjustment__' AND m.status = 'finished'
+                   ORDER BY m.kickoff_msk DESC LIMIT 5
+               ) ORDER BY kickoff_msk ASC""",
+            (uid,),
+        )
     rank = rank_row["rank"] if rank_row else "—"
     s = stats
     gap_line = ""
     if next_row and next_row["next_pts"] is not None:
         gap = next_row["next_pts"] - my_pts
         gap_line = f"\n📈 До следующего места: {gap} очк."
+    form_line = ""
+    if form_rows:
+        icons = [
+            "🎯" if r["base_points"] == 3 else ("✅" if r["base_points"] >= 1 else "❌")
+            for r in form_rows
+        ]
+        form_line = f"\n📋 Форма (посл. {len(icons)}): {''.join(icons)}"
     await message.answer(
         f"👤 <b>{message.from_user.full_name}</b>\n"
         f"🏅 Место: {rank}{gap_line}\n"
@@ -258,6 +278,7 @@ async def cmd_me(message: Message) -> None:
         f"🎯 Точных счётов: {s['exact'] or 0}\n"
         f"✅ Угаданных исходов: {s['correct_outcome'] or 0} из {s['total'] or 0}\n"
         f"✌️ Удвоений осталось: {user['doublings_left']}/8"
+        f"{form_line}"
     )
 
 

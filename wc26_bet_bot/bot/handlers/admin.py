@@ -164,6 +164,11 @@ async def _publish_result(bot: Bot, match_id: int, db) -> None:
         except Exception:
             pass
 
+    # Day summary (sends to all if this was the last match of the day)
+    from bot.services.scheduler import _maybe_send_day_summary
+    match_date = str(match_row["kickoff_msk"])[:10]
+    await _maybe_send_day_summary(bot, match_date)
+
 
 # ---------- /result — multi-step flow ----------
 
